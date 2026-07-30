@@ -157,13 +157,20 @@ def append_session_log(line):
         # 持久化日志失败不应中断正在进行的注册任务。
         pass
 
-UI_BG = "#242424"
-UI_PANEL_BG = "#2b2b2b"
-UI_FG = "#f2f2f2"
-UI_MUTED_FG = "#b8b8b8"
-UI_ENTRY_BG = "#333333"
-UI_BUTTON_BG = "#3a3a3a"
-UI_ACTIVE_BG = "#4a6078"
+# 主窗口使用浅灰背景，避免 macOS 原生控件与深色文字发生反差。
+UI_BG = "#f4f5f7"
+# 配置面板使用白色背景，突出分组边界并保持内容清晰。
+UI_PANEL_BG = "#ffffff"
+# 所有主要文本使用深灰色，确保浅色控件上的可读性。
+UI_FG = "#1f2937"
+# 次要文本使用中灰色，用于禁用控件和辅助状态信息。
+UI_MUTED_FG = "#6b7280"
+# 输入框和下拉菜单使用白色底色，与 macOS 原生控件保持一致。
+UI_ENTRY_BG = "#ffffff"
+# 普通按钮使用浅灰底色，避免与面板白色背景完全融为一体。
+UI_BUTTON_BG = "#e5e7eb"
+# 鼠标悬停和选择状态使用浅蓝色，保留明确的交互反馈。
+UI_ACTIVE_BG = "#dbeafe"
 
 DEFAULT_CONFIG = {
     "email_provider": "cloudflare",
@@ -1873,16 +1880,28 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
 # browser session state -> browser_session
 
 def setup_light_theme(root):
+    """为桌面 GUI 设置浅色调，并覆盖 Tk/ttk 控件的默认文字颜色。"""
     try:
         root.option_add("*Background", UI_BG)
         root.option_add("*Foreground", UI_FG)
         root.option_add("*selectBackground", UI_ACTIVE_BG)
         root.option_add("*selectForeground", UI_FG)
         root.option_add("*insertBackground", UI_FG)
+        root.option_add("*Button.Background", UI_BUTTON_BG)
+        root.option_add("*Button.Foreground", UI_FG)
+        root.option_add("*Button.activeBackground", UI_ACTIVE_BG)
+        root.option_add("*Button.activeForeground", UI_FG)
+        root.option_add("*Button.disabledForeground", UI_MUTED_FG)
+        root.option_add("*Menubutton.Background", UI_ENTRY_BG)
+        root.option_add("*Menubutton.Foreground", UI_FG)
+        root.option_add("*Menubutton.activeBackground", UI_ACTIVE_BG)
+        root.option_add("*Menubutton.activeForeground", UI_FG)
         root.option_add("*Entry.Background", UI_ENTRY_BG)
         root.option_add("*Text.Background", UI_ENTRY_BG)
         root.option_add("*Menu.Background", UI_ENTRY_BG)
         root.option_add("*Menu.Foreground", UI_FG)
+        root.option_add("*Menu.activeBackground", UI_ACTIVE_BG)
+        root.option_add("*Menu.activeForeground", UI_FG)
         style = ttk.Style(root)
         available = set(style.theme_names())
         if "clam" in available:
@@ -1909,6 +1928,7 @@ def tk_label(parent, text="", **kwargs):
 
 
 def tk_entry(parent, textvariable=None, width=30, **kwargs):
+    """创建带浅色背景和深色文字的文本输入框，供 GUI 配置项复用。"""
     return tk.Entry(
         parent,
         textvariable=textvariable,
@@ -1916,16 +1936,17 @@ def tk_entry(parent, textvariable=None, width=30, **kwargs):
         bg=UI_ENTRY_BG,
         fg=UI_FG,
         insertbackground=UI_FG,
-        disabledbackground="#2f2f2f",
+        disabledbackground="#eef0f2",
         disabledforeground=UI_MUTED_FG,
         highlightthickness=1,
-        highlightbackground="#555555",
+        highlightbackground="#cbd5e1",
         relief=tk.SOLID,
         **kwargs,
     )
 
 
 def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
+    """创建带浅色底和深色文字的普通操作按钮，统一处理激活与禁用状态。"""
     return tk.Button(
         parent,
         text=text,
@@ -1935,7 +1956,7 @@ def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
         fg=UI_FG,
         activebackground=UI_ACTIVE_BG,
         activeforeground=UI_FG,
-        disabledforeground="#777777",
+        disabledforeground=UI_MUTED_FG,
         relief=tk.RAISED,
         padx=10,
         pady=3,
@@ -1944,6 +1965,7 @@ def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
 
 
 def tk_checkbutton(parent, text="", variable=None, **kwargs):
+    """创建浅色界面中的复选框，保持选中状态和文字颜色可辨识。"""
     return tk.Checkbutton(
         parent,
         text=text,
@@ -1958,6 +1980,7 @@ def tk_checkbutton(parent, text="", variable=None, **kwargs):
 
 
 def tk_option_menu(parent, variable, values, width=12):
+    """创建深色文字的下拉菜单，并同步设置弹出菜单的浅色样式。"""
     menu = tk.OptionMenu(parent, variable, *values)
     menu.configure(
         width=width,
@@ -1966,10 +1989,15 @@ def tk_option_menu(parent, variable, values, width=12):
         activebackground=UI_ACTIVE_BG,
         activeforeground=UI_FG,
         highlightthickness=1,
-        highlightbackground="#555555",
+        highlightbackground="#cbd5e1",
         relief=tk.SOLID,
     )
-    menu["menu"].configure(bg=UI_ENTRY_BG, fg=UI_FG, activebackground=UI_ACTIVE_BG, activeforeground=UI_FG)
+    menu["menu"].configure(
+        bg=UI_ENTRY_BG,
+        fg=UI_FG,
+        activebackground=UI_ACTIVE_BG,
+        activeforeground=UI_FG,
+    )
     return menu
 
 def is_debug_mode():
@@ -2469,15 +2497,15 @@ class GrokRegisterGUI:
             log_frame,
             height=18,
             width=60,
-            bg="#111111",
-            fg="#f5f5f5",
-            insertbackground="#f5f5f5",
-            selectbackground="#345a8a",
-            selectforeground="#ffffff",
+            bg="#ffffff",
+            fg=UI_FG,
+            insertbackground=UI_FG,
+            selectbackground="#bfdbfe",
+            selectforeground=UI_FG,
             relief=tk.SOLID,
             borderwidth=1,
             highlightthickness=1,
-            highlightbackground="#555555",
+            highlightbackground="#cbd5e1",
         )
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         self.log("[*] GUI 已就绪，配置已加载")
