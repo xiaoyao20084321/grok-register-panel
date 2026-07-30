@@ -1341,7 +1341,7 @@ def write_cpa_auth(auth_dir: Path, record: dict) -> Path:
 
 
 def grok2api_auth_filename(entry: dict, email: str = "") -> str:
-    """Grok2API / 官方 grok 风格文件名。"""
+    """生成 Grok2API Grok Build 单账号导入文件名，避免不同邮箱相互覆盖。"""
     ident = (
         str(email or "").strip()
         or str(entry.get("email") or "").strip()
@@ -1349,15 +1349,80 @@ def grok2api_auth_filename(entry: dict, email: str = "") -> str:
         or secrets.token_hex(4)
     )
     safe = _safe_email_for_filename(ident)
-    return f"g2a-{safe}.json"
+    return f"grok2api-grok-build-accounts-{safe}.json"
+
+
+def token_to_grok2api_account(token: dict, email: str = "") -> dict:
+    """把 xAI OAuth token 转换成 Grok2API 导入文件中的 Grok Build 账号对象。
+
+    返回字段与 Grok2API 管理后台导出的 ``accounts`` 数组元素一致。敏感 token
+    仅在返回对象中原样传递，不写日志；过期时间优先采用访问令牌的 JWT 声明。
+    """
+    access_token = str(token.get("access_token") or token.get("key") or "").strip()
+    refresh_token = str(token.get("refresh_token") or "").strip()
+    if not access_token:
+        raise ValueError("Grok2API 导入记录缺少 access_token")
+    if not refresh_token:
+        raise ValueError("Grok2API 导入记录缺少 refresh_token")
+
+    claims = decode_jwt_payload(access_token)
+    user_id = str(
+        claims.get("sub")
+        or claims.get("principal_id")
+        or token.get("user_id")
+        or ""
+    ).strip()
+    resolved_email = str(
+        email
+        or token.get("email")
+        or claims.get("email")
+        or user_id
+    ).strip()
+    client_id = str(
+        token.get("client_id")
+        or claims.get("client_id")
+        or claims.get("aud")
+        or CLIENT_ID
+    ).strip()
+
+    expires_at = str(token.get("expires_at") or "").strip()
+    if not expires_at:
+        expires_at = rfc3339_ns(
+            float(claims.get("exp") or (time.time() + int(token.get("expires_in") or 21600)))
+        )
+
+    return {
+        "provider": "grok_build",
+        "name": resolved_email,
+        "client_id": client_id or CLIENT_ID,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": "",
+        "token_type": "Bearer",
+        "scope": "",
+        "expires_at": expires_at,
+        "expires_in": 0,
+        "email": resolved_email,
+        "sub": "",
+        "user_id": user_id,
+        "principal_id": "",
+        "team_id": "",
+    }
 
 
 def write_grok2api_auth(auth_dir: Path, token: dict, email: str = "") -> Path:
-    """写出 Grok2API / ~/.grok 风格 auth（issuer::client_id 嵌套）。"""
+    """写出可由 Grok2API 管理后台直接导入的单账号 ``accounts`` JSON 文件。"""
     auth_dir.mkdir(parents=True, exist_ok=True)
-    key, entry = token_to_auth_entry(token, email=email)
-    path = auth_dir / grok2api_auth_filename(entry, email=email)
-    write_auth_json(path, key, entry)
+    account = token_to_grok2api_account(token, email=email)
+    path = auth_dir / grok2api_auth_filename(account, email=email)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = {"accounts": [account]}
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    _ensure_private_file(path)
     return path
 
 

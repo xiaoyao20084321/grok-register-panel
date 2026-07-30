@@ -35,6 +35,7 @@ import sso_to_auth_json as _s2cpa
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
+from email_providers import icloud_hme as icloud_hme_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
@@ -172,8 +173,27 @@ UI_BUTTON_BG = "#e5e7eb"
 # 鼠标悬停和选择状态使用浅蓝色，保留明确的交互反馈。
 UI_ACTIVE_BG = "#dbeafe"
 
+# DEFAULT_CONFIG 汇总所有 provider、代理、注册流程和输出目录的默认配置。
 DEFAULT_CONFIG = {
     "email_provider": "cloudflare",
+    # iCloud HME API 仅通过本机 SSH 隧道访问，禁止配置公网服务地址。
+    "icloud_api_base": "http://127.0.0.1:18090",
+    # 开启后由注册机自动复用或建立 SSH 本地端口转发。
+    "icloud_enable_tunnel": True,
+    # SSH 私钥只用于本地启动隧道，App 专用密码不会进入本配置。
+    "icloud_ssh_key": "~/.ssh/MaXiangLinTxCloudMiYao.pem",
+    # SSH 登录用户与云服务器系统账号保持一致。
+    "icloud_ssh_user": "ubuntu",
+    # SSH 主机必须由 config.json 显式配置，示例文件提供当前部署地址。
+    "icloud_ssh_host": "",
+    # 本地监听端口必须与 icloud_api_base 中的端口一致。
+    "icloud_local_port": 18090,
+    # 远端端口对应服务器回环地址上的 icloud-hme 服务。
+    "icloud_remote_port": 8090,
+    # 单次 icloud-hme API 请求超时，单位为秒。
+    "icloud_request_timeout": 30,
+    # SSH 隧道启动后等待 API 就绪的最长时间，单位为秒。
+    "icloud_tunnel_timeout": 15,
     "duckmail_api_key": "",
     "duckmail_api_base": "https://api.duckmail.sbs",
     "defaultDomains": "",
@@ -205,7 +225,7 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
-    # Grok2API / ~/.grok 风格 auth 目录（默认项目根目录下 grok2api_auth/）
+    # Grok2API Grok Build 管理后台导入文件目录（默认项目根目录下 grok2api_auth/）
     "grok2api_auth_dir": "grok2api_auth",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
@@ -598,7 +618,10 @@ def get_proxies():
     return {}
 
 
+# _MAIL_DIRECT_MARKERS 标识不得经过住宅代理的本地或邮箱服务请求。
 _MAIL_DIRECT_MARKERS = (
+    "http://127.0.0.1:",
+    "http://localhost:",
     "mail-api.example.com",
     "hermaly.com",
     "example.com",
@@ -609,6 +632,7 @@ _MAIL_DIRECT_MARKERS = (
 
 
 def _url_needs_direct(url: str) -> bool:
+    """判断请求是否必须绕过注册住宅代理直接访问。"""
     u = str(url or "").lower()
     return any(m in u for m in _MAIL_DIRECT_MARKERS)
 
@@ -1330,12 +1354,66 @@ def cloudmail_get_oai_code(
     )
 
 
+def get_icloud_hme_state_path():
+    """返回 iCloud HME 保留邮箱记录路径，供以后按账号和邮箱继续查询。"""
+    return accounts_side_file("icloud_hme_leases.json")
+
+
+def icloud_hme_get_email_and_token(log_callback=None):
+    """通过 icloud-hme 创建隐私邮箱并返回非敏感租约令牌。"""
+    return icloud_hme_provider.create_mailbox(
+        config,
+        get_icloud_hme_state_path(),
+        log_callback=log_callback,
+    )
+
+
+def icloud_hme_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    """按隐私邮箱精确轮询 iCloud IMAP 邮件并提取 xAI 验证码。"""
+    return icloud_hme_provider.wait_for_code(
+        config,
+        get_icloud_hme_state_path(),
+        dev_token,
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
+
+
+def retain_email_provider_alias(log_callback=None):
+    """结束当前 worker 的邮箱占用并永久保留 iCloud 别名及其本地记录。"""
+    if get_email_provider() != "icloud":
+        return True
+    return icloud_hme_provider.retain_current_alias(
+        config,
+        get_icloud_hme_state_path(),
+        log_callback=log_callback,
+    )
+
+
 def get_email_provider():
-    return config.get("email_provider", "cloudflare")
+    """返回规范化后的邮箱提供商名称。"""
+    return str(config.get("email_provider", "cloudflare") or "cloudflare").strip().lower()
 
 
 def get_email_and_token(api_key=None):
+    """按当前 provider 创建邮箱并返回邮箱地址和后续收信令牌。"""
     provider = get_email_provider()
+    if provider == "icloud":
+        return icloud_hme_get_email_and_token()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
@@ -1382,7 +1460,18 @@ def get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
+    """按当前 provider 轮询注册验证码。"""
     provider = get_email_provider()
+    if provider == "icloud":
+        return icloud_hme_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -2056,7 +2145,10 @@ def _wire_runtime_modules():
 # register page flow -> register_flow
 
 class GrokRegisterGUI:
+    """提供邮箱、代理、注册流程和结果统计配置的桌面界面。"""
+
     def __init__(self, root):
+        """初始化主窗口状态并构建全部控件。"""
         self.root = root
         self._ui_thread_id = threading.get_ident()
         self.root.title("Grok 注册机")
@@ -2095,6 +2187,7 @@ class GrokRegisterGUI:
             pass
 
     def setup_ui(self):
+        """根据配置构建主界面，并按邮箱 provider 切换专属字段。"""
         load_config()
         _wire_runtime_modules()
         main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
@@ -2141,7 +2234,7 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
+            ["icloud", "duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
@@ -2339,7 +2432,126 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # iCloud HME
+        # 本地 API 地址始终指向 SSH 隧道监听端口。
+        self.icloud_api_base_var = tk.StringVar(
+            value=str(
+                config.get("icloud_api_base", "http://127.0.0.1:18090")
+                or "http://127.0.0.1:18090"
+            )
+        )
+        # 自动隧道开关控制注册机是否自行管理 SSH 子进程。
+        self.icloud_enable_tunnel_var = tk.BooleanVar(
+            value=bool(config.get("icloud_enable_tunnel", True))
+        )
+        # SSH 私钥路径仅用于本机端口转发，不承载 iCloud 凭据。
+        self.icloud_ssh_key_var = tk.StringVar(
+            value=str(
+                config.get(
+                    "icloud_ssh_key", "~/.ssh/MaXiangLinTxCloudMiYao.pem"
+                )
+                or "~/.ssh/MaXiangLinTxCloudMiYao.pem"
+            )
+        )
+        # SSH 用户对应云服务器系统登录账号。
+        self.icloud_ssh_user_var = tk.StringVar(
+            value=str(config.get("icloud_ssh_user", "ubuntu") or "ubuntu")
+        )
+        # SSH 主机对应仅通过密钥访问的 icloud-hme 云服务器。
+        self.icloud_ssh_host_var = tk.StringVar(
+            value=str(config.get("icloud_ssh_host", "") or "")
+        )
+        # 本地端口与 API Base 中的监听端口保持一致。
+        self.icloud_local_port_var = tk.StringVar(
+            value=str(config.get("icloud_local_port", 18090) or 18090)
+        )
+        # 远端端口对应云服务器回环地址上的 icloud-hme 服务。
+        self.icloud_remote_port_var = tk.StringVar(
+            value=str(config.get("icloud_remote_port", 8090) or 8090)
+        )
+        # iCloud 专属控件集合用于切换 provider 时统一显示或隐藏。
+        self._icloud_widgets = [
+            p_label(0, 0, "API Base:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_api_base_var,
+                    width=52,
+                ),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "SSH 主机:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_ssh_host_var,
+                    width=34,
+                ),
+                1,
+                1,
+            ),
+            p_label(1, 2, "SSH 用户:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_ssh_user_var,
+                    width=34,
+                ),
+                1,
+                3,
+            ),
+            p_label(2, 0, "SSH 私钥:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_ssh_key_var,
+                    width=52,
+                ),
+                2,
+                1,
+                columnspan=3,
+            ),
+            p_label(3, 0, "本地端口:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_local_port_var,
+                    width=16,
+                ),
+                3,
+                1,
+                sticky=tk.W,
+            ),
+            p_label(3, 2, "远端端口:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_remote_port_var,
+                    width=16,
+                ),
+                3,
+                3,
+                sticky=tk.W,
+            ),
+            p_label(4, 0, "隧道:"),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="自动建立或复用 SSH 隧道",
+                    variable=self.icloud_enable_tunnel_var,
+                ),
+                4,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
+        # provider 控件映射保证界面只显示当前邮箱后端的配置字段。
         self._provider_widget_groups = {
+            "icloud": self._icloud_widgets,
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
             "yyds": self._yyds_widgets,
@@ -2515,6 +2727,7 @@ class GrokRegisterGUI:
         """按当前邮箱服务商只显示相关配置项。"""
         provider = (self.email_provider_var.get() or "cloudflare").strip().lower()
         titles = {
+            "icloud": "iCloud Hide My Email 配置",
             "duckmail": "DuckMail / Mail.tm 配置",
             "cloudflare": "Cloudflare 配置",
             "yyds": "YYDS 配置",
@@ -2528,6 +2741,29 @@ class GrokRegisterGUI:
         for widget in self._provider_widget_groups.get(provider, self._cloudflare_widgets):
             # grid_remove 后无参 grid() 会恢复原行列
             widget.grid()
+
+    def _apply_icloud_ui_config(self):
+        """把 GUI 中的 iCloud HME 和 SSH 隧道字段写回内存配置。"""
+        config["icloud_api_base"] = (
+            self.icloud_api_base_var.get().strip() or "http://127.0.0.1:18090"
+        )
+        config["icloud_enable_tunnel"] = bool(
+            self.icloud_enable_tunnel_var.get()
+        )
+        config["icloud_ssh_key"] = (
+            self.icloud_ssh_key_var.get().strip()
+            or "~/.ssh/MaXiangLinTxCloudMiYao.pem"
+        )
+        config["icloud_ssh_user"] = (
+            self.icloud_ssh_user_var.get().strip() or "ubuntu"
+        )
+        config["icloud_ssh_host"] = self.icloud_ssh_host_var.get().strip()
+        config["icloud_local_port"] = int(
+            self.icloud_local_port_var.get().strip() or "18090"
+        )
+        config["icloud_remote_port"] = int(
+            self.icloud_remote_port_var.get().strip() or "8090"
+        )
 
     def _refresh_cpa_fields(self):
         """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
@@ -2606,6 +2842,7 @@ class GrokRegisterGUI:
             config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
             config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
             config["cloudmail_password"] = self.cloudmail_password_var.get()
+            self._apply_icloud_ui_config()
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
             if "协议" in _mode_text:
@@ -2620,8 +2857,9 @@ class GrokRegisterGUI:
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log(f"[!] 当前配置无法用于连通性检查: {exc}")
+            return
         self.log("[*] 开始连通性检查...")
         self.check_btn.config(state=tk.DISABLED)
 
@@ -2680,6 +2918,7 @@ class GrokRegisterGUI:
         return self.stop_requested or not self.is_running
 
     def start_registration(self):
+        """校验 GUI 配置并启动本轮注册任务。"""
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
             return
@@ -2707,6 +2946,11 @@ class GrokRegisterGUI:
         config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
         config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
         config["cloudmail_password"] = self.cloudmail_password_var.get()
+        try:
+            self._apply_icloud_ui_config()
+        except ValueError:
+            self.log("[!] iCloud HME 本地端口或远端端口必须是整数")
+            return
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()
         if "协议" in _mode_text:
@@ -2747,6 +2991,15 @@ class GrokRegisterGUI:
                 missing.append("默认收信域名")
             if missing:
                 self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
+                return
+        if config["email_provider"] == "icloud":
+            if not str(config.get("icloud_api_base", "") or "").strip():
+                self.log("[!] iCloud 模式需要配置本地 API Base")
+                return
+            if config.get("icloud_enable_tunnel") and not str(
+                config.get("icloud_ssh_host", "") or ""
+            ).strip():
+                self.log("[!] iCloud 自动隧道模式需要配置 SSH 主机")
                 return
         if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url") and not config.get("grok2api_auth_dir"):
             self.log("[!] 已开启 SSO→auth，但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录")
@@ -2860,6 +3113,7 @@ class GrokRegisterGUI:
             )
 
     def run_registration(self, count, worker_id=0, workers=1):
+        """在指定 GUI worker 中执行注册，并在结束时保留已创建的 iCloud 别名。"""
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
 
         def wlog(message):
@@ -3027,6 +3281,10 @@ class GrokRegisterGUI:
                     i += 1
                     wlog(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 finally:
+                    try:
+                        retain_email_provider_alias(log_callback=wlog)
+                    except Exception as retain_exc:
+                        wlog(f"[!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}")
                     self.update_stats()
                     if self.should_stop():
                         break
@@ -3079,6 +3337,7 @@ def cli_log(message):
 
 
 def run_registration_cli(count):
+    """执行 CLI 单线程或多线程注册，并在每次尝试后保留 iCloud 别名。"""
     controller = CliStopController()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
@@ -3147,6 +3406,7 @@ def run_registration_cli(count):
         shared = {"success": 0, "fail": 0, "fail_stats": empty_fail_stats()}
 
         def worker(n, wid):
+            """执行单个 CLI worker 的注册分片并汇总局部统计。"""
             local_success = 0
             local_fail = 0
             local_fail_stats = empty_fail_stats()
@@ -3372,6 +3632,14 @@ def run_registration_cli(count):
                         elif local_success > 0 and local_success % 2 == 0:
                             rotate_idx += 1
                     finally:
+                        try:
+                            retain_email_provider_alias(
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            )
+                        except Exception as retain_exc:
+                            cli_log(
+                                f"[W{wid+1}] [!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}"
+                            )
                         if i < n and not controller.should_stop():
                             try:
                                 stop_browser()
@@ -3574,6 +3842,10 @@ def run_registration_cli(count):
                 i += 1
                 cli_log(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             finally:
+                try:
+                    retain_email_provider_alias(log_callback=cli_log)
+                except Exception as retain_exc:
+                    cli_log(f"[!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}")
                 if controller.should_stop():
                     break
                 # 每轮结束只关浏览器，不立刻再开。

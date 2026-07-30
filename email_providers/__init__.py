@@ -5,4 +5,5 @@
 - yyds: YYDS
 - mailnest: 迈巢 Outlook
 - cloudmail: maillab/cloud-mail
+- icloud_hme: 通过 SSH 隧道访问 iCloud Hide My Email
 """

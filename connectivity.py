@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import socket
 import time
+from pathlib import Path
 from typing import Callable, List, Tuple
 from urllib.parse import urlparse
 
 from email_providers import cloudflare as cloudflare_provider
+from email_providers import icloud_hme as icloud_hme_provider
 
 CheckResult = Tuple[str, bool, str]  # name, ok, detail
 XAI_SIGNUP_CHECK_NAME = "xAI注册页"
@@ -113,8 +115,35 @@ def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:
+    """检查当前邮箱 provider 的必填配置、网络可达性和关键认证状态。"""
     provider = (provider or "").strip().lower()
     try:
+        if provider == "icloud":
+            state_path = str(
+                Path(__file__).resolve().parent
+                / "accounts"
+                / "icloud_hme_leases.json"
+            )
+            summary = icloud_hme_provider.check_connectivity(
+                config,
+                state_path,
+            )
+            active = int(summary.get("active", 0) or 0)
+            imap_ready = int(summary.get("imap_ready", 0) or 0)
+            if active <= 0:
+                return "邮箱API", False, "iCloud HME 可达，但没有 active 账号"
+            if imap_ready <= 0:
+                return (
+                    "邮箱API",
+                    False,
+                    f"iCloud HME 可达，active={active}，但尚未配置 App 专用密码/IMAP",
+                )
+            return (
+                "邮箱API",
+                True,
+                f"iCloud HME 可达，active={active}，IMAP 就绪={imap_ready}",
+            )
+
         if provider == "cloudflare":
             base = str(config.get("cloudflare_api_base", "") or "").rstrip("/")
             if not base:

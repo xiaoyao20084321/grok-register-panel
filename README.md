@@ -24,7 +24,7 @@ Based on [AaronL725/grok-register](https://github.com/AaronL725/grok-register) (
 | 能力 | 说明 |
 |------|------|
 | 注册全链路 | 邮箱 OTP → 资料页 → Turnstile → SSO → Device / OAuth → 写入 CPA / Grok2API |
-| 多邮箱后端 | Cloudflare Worker 邮、DuckMail、YYDS、MailNest、CloudMail 等 |
+| 多邮箱后端 | iCloud Hide My Email、Cloudflare Worker 邮、DuckMail、YYDS、MailNest、CloudMail 等 |
 | 反检测浏览器 | [Camoufox](https://camoufox.com/)（Gecko 层指纹） |
 | 出口预检 | 启动前解析出口 IP / ASN，命中黑名单直接换口 |
 | 风控早停 | `botFlagSource=1` + `policy=deny` 时跳过后续 OAuth，避免无效重试 |
@@ -84,7 +84,11 @@ cp config.example.json config.json
 
 | 字段 | 说明 |
 |------|------|
-| `email_provider` | `cloudflare` / `duckmail` / `yyds` / `mailnest` / … |
+| `email_provider` | `icloud` / `cloudflare` / `duckmail` / `yyds` / `mailnest` / … |
+| `icloud_api_base` | SSH 隧道在本机暴露的 icloud-hme API，默认 `http://127.0.0.1:18090` |
+| `icloud_enable_tunnel` | iCloud 模式下自动建立或复用 SSH 本地端口转发 |
+| `icloud_ssh_key` / `icloud_ssh_user` / `icloud_ssh_host` | SSH 私钥、用户和云服务器地址 |
+| `icloud_local_port` / `icloud_remote_port` | 本地监听端口和服务器回环地址上的 icloud-hme 端口 |
 | `defaultDomains` | 临时邮域名（如二级 CF 域） |
 | `cloudflare_*` / `duckmail_*` 等 | 对应邮箱 API |
 | `proxy` | 默认 HTTP 代理，如 `http://127.0.0.1:7890` |
@@ -93,8 +97,22 @@ cp config.example.json config.json
 | `register_count` | 单次目标数量 |
 | `cpa_auto_add` | 是否 SSO→OAuth 并写入 auth |
 | `cpa_auth_dir` | 本地 CPA 目录（`xai-*.json`） |
-| `grok2api_auth_dir` | Grok2API 风格 auth 目录 |
+| `grok2api_auth_dir` | Grok2API Grok Build 管理后台可导入的 `accounts` JSON 目录 |
 | `cpa_remote_url` / `cpa_management_key` | 远程 CPA Management API（可选） |
+
+### iCloud Hide My Email
+
+`email_provider=icloud` 时，注册机会自动建立或复用 SSH 隧道，从
+`GET /api/accounts` 获取全部 active 账号并稳定轮询。每次注册创建一个
+HME 别名，并通过 IMAP 按别名精确读取验证码。创建后的别名会永久保留，
+无论注册成功、失败、换邮箱、用户停止或程序退出都不会调用删除接口。
+
+已创建别名的账号、邮箱和非敏感租约信息会以 0600 权限记录到
+`accounts/icloud_hme_leases.json`，供以后定位邮箱所属的 iCloud 账号。
+
+App 专用密码只保存在服务器端 `icloud-hme/data/accounts.json`，不要写入
+`grok-register/config.json`。首次使用前，需要先通过 icloud-hme 的账号接口
+保存 App 专用密码，并确认服务器端 IMAP 连接测试通过。
 
 ### 环境变量
 
