@@ -297,6 +297,8 @@ FAIL_STUCK = "stuck_retry"
 FAIL_SSO = "sso_timeout"
 FAIL_TURNSTILE = "turnstile"
 FAIL_PROFILE = "profile_fill"
+# FAIL_ICLOUD_LIMIT 单独统计 Apple 隐藏邮箱创建额度，避免归入模糊的“其它”。
+FAIL_ICLOUD_LIMIT = "icloud_hme_limit"
 FAIL_OTHER = "other"
 
 
@@ -358,6 +360,7 @@ FAIL_LABELS = {
     FAIL_SSO: "SSO超时",
     FAIL_TURNSTILE: "资料页Turnstile",
     FAIL_PROFILE: "资料填写",
+    FAIL_ICLOUD_LIMIT: "iCloud额度",
     FAIL_OTHER: "其它",
 }
 
@@ -447,6 +450,8 @@ def record_register_result(
 
 
 def classify_failure(exc) -> str:
+    if isinstance(exc, icloud_hme_provider.ICloudHMEAddressLimitError):
+        return FAIL_ICLOUD_LIMIT
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
     if isinstance(exc, RegistrationRiskDenied):
@@ -4310,6 +4315,17 @@ class GrokRegisterGUI:
                 except RegistrationCancelled:
                     wlog("[!] 注册被用户停止")
                     break
+                except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
+                    kind = self._record_failure(exc)
+                    retry_count_for_slot = 0
+                    i += 1
+                    # 额度属于账号级上游限制，继续换代理或等待账号间隔没有意义。
+                    self.stop_requested = True
+                    wlog(
+                        f"[-] iCloud HME 创建额度受限 "
+                        f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                    )
+                    wlog("[!] 所有活跃 iCloud 账号当前均不可创建地址，已自动停止整批任务")
                 except EmailDomainRejected as exc:
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
@@ -4657,6 +4673,30 @@ def run_registration_cli(count):
                             rotate_idx += 1
                     except RegistrationCancelled:
                         break
+                    except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
+                        kind = classify_failure(exc)
+                        local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                        local_fail += 1
+                        i += 1
+                        retry = 0
+                        # 多 worker 共用停止控制器，首个额度异常会通知其他 worker 收尾。
+                        controller.stop()
+                        cli_log(
+                            f"[W{wid+1}] [-] iCloud HME 创建额度受限 "
+                            f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                        )
+                        cli_log(
+                            f"[W{wid+1}] [!] 所有活跃 iCloud 账号当前均不可创建地址，"
+                            "已自动停止整批任务"
+                        )
+                        record_register_result(
+                            "fail",
+                            email if email else "",
+                            kind=kind,
+                            detail=str(exc)[:300],
+                            worker=f"W{wid+1}",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                     except EmailDomainRejected as exc:
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -5013,6 +5053,16 @@ def run_registration_cli(count):
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
+            except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
+                kind = _cli_record_failure(exc)
+                retry_count_for_slot = 0
+                i += 1
+                controller.stop()
+                cli_log(
+                    f"[-] iCloud HME 创建额度受限 "
+                    f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                )
+                cli_log("[!] 所有活跃 iCloud 账号当前均不可创建地址，已自动停止整批任务")
             except EmailDomainRejected as exc:
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0

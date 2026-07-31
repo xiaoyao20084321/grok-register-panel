@@ -48,6 +48,10 @@ class ICloudHMEError(RuntimeError):
     """表示 iCloud HME API、SSH 隧道或别名生命周期操作失败。"""
 
 
+class ICloudHMEAddressLimitError(ICloudHMEError):
+    """表示所有可用 iCloud 账号当前都无法继续创建隐藏邮箱地址。"""
+
+
 class ICloudHMEProvider:
     """管理 iCloud HME 服务连接、账号轮询和隐私邮箱租约。"""
 
@@ -139,12 +143,34 @@ class ICloudHMEProvider:
         }
 
     def create_mailbox(self) -> Tuple[str, str]:
-        """轮询选择活跃账号并创建永久保留的隐私邮箱，返回地址和租约令牌。"""
+        """轮询活跃账号创建隐私邮箱，全部账号受限时抛出批次终止异常。"""
         self._ensure_configured()
         self._ensure_service()
         self._retain_current_before_reuse()
 
-        account = self._next_account()
+        accounts = self._ordered_active_accounts()
+        limit_errors = []
+        for account in accounts:
+            account_id = str(account.get("id", "") or "")
+            try:
+                return self._create_mailbox_for_account(account)
+            except ICloudHMEAddressLimitError as exc:
+                limit_errors.append(str(exc))
+                self._log(
+                    f"[!] iCloud 账号 {account_id} 当前创建额度受限"
+                    + ("，继续尝试下一个活跃账号" if len(accounts) > 1 else "")
+                )
+
+        detail = limit_errors[-1] if limit_errors else "Apple 未返回具体原因"
+        raise ICloudHMEAddressLimitError(
+            f"全部 {len(accounts)} 个活跃 iCloud 账号均达到当前创建限制: {detail}"
+        )
+
+    def _create_mailbox_for_account(
+        self,
+        account: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """使用指定 iCloud 账号创建一个永久保留的隐私邮箱及本地租约。"""
         account_id = str(account.get("id", "") or "")
         lease_id = uuid.uuid4().hex
         label = f"grok-register:{lease_id}"
@@ -153,6 +179,7 @@ class ICloudHMEProvider:
             "account_id": account_id,
             "email": "",
             "label": label,
+            "status": "creating",
             "created_at": _datetime.datetime.now(
                 _datetime.timezone.utc
             ).isoformat(),
@@ -171,14 +198,24 @@ class ICloudHMEProvider:
             if not email or "@" not in email:
                 raise ICloudHMEError("创建隐私邮箱成功响应缺少有效 email")
             lease["email"] = email
+            lease["status"] = "created"
             self._save_lease(lease)
 
             self._log(
                 f"[*] iCloud HME 已创建并保留隐私邮箱，账号={account_id}，邮箱={email}"
             )
             return email, lease_id
-        except Exception:
+        except ICloudHMEAddressLimitError as exc:
+            # 明确的额度拒绝不会在 Apple 侧创建别名，仅保留失败记录供审计。
+            lease["status"] = "create_limit"
+            lease["error"] = str(exc)[:500]
+            self._save_lease(lease)
+            raise
+        except Exception as exc:
             # 创建请求可能已经在 Apple 侧生效；保留租约记录且绝不调用删除接口。
+            lease["status"] = "create_uncertain"
+            lease["error"] = str(exc)[:500]
+            self._save_lease(lease)
             self._log(
                 f"[!] iCloud HME 创建流程异常，按保留策略不删除可能已创建的别名: {label}"
             )
@@ -289,9 +326,13 @@ class ICloudHMEProvider:
         lease = self._get_lease(lease_id) or {}
         self._thread_state.lease_id = ""
         email = str(lease.get("email", "") or "").strip()
-        self._log(
-            f"[*] iCloud HME 已保留隐私邮箱: {email or lease_id}"
-        )
+        status = str(lease.get("status", "") or "")
+        if email:
+            self._log(f"[*] iCloud HME 已保留隐私邮箱: {email}")
+        elif status == "create_limit":
+            self._log("[*] iCloud HME 本次未创建邮箱地址；已保留额度失败记录")
+        else:
+            self._log("[*] iCloud HME 未取得可确认的邮箱地址；已保留待核对租约记录")
         return True
 
     def shutdown(self) -> None:
@@ -478,9 +519,17 @@ class ICloudHMEProvider:
                 if isinstance(payload, dict)
                 else str(payload)
             )
-            raise ICloudHMEError(
-                f"iCloud HME API 失败，HTTP {status}: {message or '未知错误'}"
-            )
+            detail = f"iCloud HME API 失败，HTTP {status}: {message or '未知错误'}"
+            normalized_message = message.casefold()
+            if path.rstrip("/") == "/api/create" and (
+                "limit of addresses" in normalized_message
+                or (
+                    "reached the limit" in normalized_message
+                    and "address" in normalized_message
+                )
+            ):
+                raise ICloudHMEAddressLimitError(detail)
+            raise ICloudHMEError(detail)
         return payload
 
     def _list_accounts(self) -> List[Dict[str, Any]]:
@@ -498,17 +547,17 @@ class ICloudHMEProvider:
         )
         return accounts
 
-    def _next_account(self) -> Dict[str, Any]:
-        """从活跃账号中线程安全地循环选择下一账号。"""
+    def _ordered_active_accounts(self) -> List[Dict[str, Any]]:
+        """返回从当前轮询游标开始的全部活跃账号，并推进下一轮起点。"""
         accounts = [
             item for item in self._list_accounts() if self._is_active_account(item)
         ]
         if not accounts:
             raise ICloudHMEError("iCloud HME 没有 status=active 的可用账号")
         with self._lock:
-            account = accounts[self._account_cursor % len(accounts)]
+            start = self._account_cursor % len(accounts)
             self._account_cursor = (self._account_cursor + 1) % len(accounts)
-        return account
+        return accounts[start:] + accounts[:start]
 
     @staticmethod
     def _is_active_account(account: Dict[str, Any]) -> bool:

@@ -117,6 +117,9 @@ Grok2API Web SSO 与 Grok2API Build OAuth；Web 与 Build 使用两个独立接�
 `GET /api/accounts` 获取全部 active 账号并稳定轮询。每次注册创建一个
 HME 别名，并通过 IMAP 按别名精确读取验证码。创建后的别名会永久保留，
 无论注册成功、失败、换邮箱、用户停止或程序退出都不会调用删除接口。
+若某个 iCloud 账号返回 Apple 创建额度限制，程序会继续尝试本轮其他活跃
+账号；所有活跃账号均受限时会立即停止整批注册，避免继续浪费代理和等待时间。
+额度失败只保留本地审计记录，不再把租约 UUID 显示成已创建邮箱。
 
 已创建别名的账号、邮箱和非敏感租约信息会以 0600 权限记录到
 `accounts/icloud_hme_leases.json`，供以后定位邮箱所属的 iCloud 账号。
