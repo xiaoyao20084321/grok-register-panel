@@ -3282,7 +3282,7 @@ class GrokRegisterGUI:
             )
 
         # 公共配置
-        add_label(0, 0, "邮箱服务商:")
+        add_label(1, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "cloudflare"))
         self.email_provider_combo = tk_option_menu(
             config_frame,
@@ -3290,7 +3290,7 @@ class GrokRegisterGUI:
             ["icloud", "duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
             width=12,
         )
-        add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
+        add_field(self.email_provider_combo, 1, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
@@ -3310,9 +3310,9 @@ class GrokRegisterGUI:
         )
         add_field(self.count_spinbox, 0, 3, sticky=tk.W)
 
-        add_label(1, 0, "注册选项:")
+        add_label(0, 0, "注册选项:")
         opt_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
-        add_field(opt_frame, 1, 1, sticky=tk.W)
+        add_field(opt_frame, 0, 1, sticky=tk.W)
         self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
         self.nsfw_check = tk_checkbutton(opt_frame, text="注册后开启 NSFW（可选）", variable=self.nsfw_var)
         self.nsfw_check.pack(side=tk.LEFT)
@@ -3326,12 +3326,10 @@ class GrokRegisterGUI:
         self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
         self.log_level_combo.pack(side=tk.LEFT)
 
-        add_label(1, 2, "代理（可选）:")
+        # proxy_var 保存普通代理与 Resin 共用的代理入口地址。
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
-        self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
-        add_field(self.proxy_entry, 1, 3)
 
-        add_label(2, 0, "代理类型:")
+        add_label(3, 0, "代理类型:")
         # proxy_mode_var 保存 GUI 展示值，写入配置时转换为 normal/resin。
         self.proxy_mode_var = tk.StringVar(
             value=(
@@ -3347,14 +3345,54 @@ class GrokRegisterGUI:
             ["普通代理", "Resin 粘性代理"],
             width=16,
         )
-        add_field(self.proxy_mode_combo, 2, 1, sticky=tk.W)
+        add_field(self.proxy_mode_combo, 3, 1, sticky=tk.W)
 
-        # resin_frame 仅在 Resin 模式显示认证、平台和独立 SSH 隧道配置。
-        self.resin_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        # proxy_details_frame 承载当前代理模式对应的地址、认证及隧道输入项。
+        self.proxy_details_frame = tk.LabelFrame(
+            config_frame,
+            text="代理配置",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.proxy_details_frame.grid(
+            row=4,
+            column=0,
+            columnspan=4,
+            sticky=tk.EW,
+            pady=(6, 4),
+        )
+        self.proxy_details_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.proxy_details_frame.grid_columnconfigure(3, weight=1, minsize=240)
+        tk_label(
+            self.proxy_details_frame,
+            text="代理地址（可选）:",
+            bg=UI_PANEL_BG,
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+        # proxy_entry 允许普通代理和 Resin 复用同一个入口地址配置。
+        self.proxy_entry = tk_entry(
+            self.proxy_details_frame,
+            textvariable=self.proxy_var,
+            width=52,
+        )
+        self.proxy_entry.grid(
+            row=0,
+            column=1,
+            columnspan=3,
+            sticky=tk.EW,
+            padx=(0, 14),
+            pady=3,
+        )
+
+        # resin_frame 仅在 Resin 模式显示 Token、平台和可选 SSH 配置。
+        self.resin_frame = tk.Frame(self.proxy_details_frame, bg=UI_PANEL_BG)
         self.resin_frame.grid(
-            row=2,
-            column=2,
-            columnspan=2,
+            row=1,
+            column=0,
+            columnspan=4,
             sticky=tk.EW,
             padx=(0, 14),
             pady=3,
@@ -3408,6 +3446,20 @@ class GrokRegisterGUI:
         self.resin_remote_port_var = tk.StringVar(
             value=str(config.get("resin_remote_port", 2260) or 2260)
         )
+        # resin_tunnel_check 控制 Resin SSH 配置区是否显示及是否自动管理隧道。
+        self.resin_tunnel_check = tk_checkbutton(
+            config_frame,
+            text="是否需要自动建立或复用 SSH 通道",
+            variable=self.resin_enable_tunnel_var,
+        )
+        self.resin_tunnel_check.grid(
+            row=3,
+            column=2,
+            columnspan=2,
+            sticky=tk.W,
+            padx=(0, 14),
+            pady=3,
+        )
         tk_label(self.resin_frame, text="Resin Token:", bg=UI_PANEL_BG).grid(
             row=0,
             column=0,
@@ -3440,102 +3492,99 @@ class GrokRegisterGUI:
             width=18,
         )
         self.resin_platform_entry.grid(row=0, column=3, sticky=tk.EW)
-        tk_label(self.resin_frame, text="SSH 主机:", bg=UI_PANEL_BG).grid(
+
+        # resin_ssh_frame 仅在 Resin 模式且启用 SSH 通道时显示连接参数。
+        self.resin_ssh_frame = tk.Frame(self.resin_frame, bg=UI_PANEL_BG)
+        self.resin_ssh_frame.grid(
             row=1,
+            column=0,
+            columnspan=4,
+            sticky=tk.EW,
+            pady=(4, 0),
+        )
+        self.resin_ssh_frame.grid_columnconfigure(1, weight=1)
+        self.resin_ssh_frame.grid_columnconfigure(3, weight=1)
+        tk_label(self.resin_ssh_frame, text="SSH 主机:", bg=UI_PANEL_BG).grid(
+            row=0,
             column=0,
             sticky=tk.W,
             padx=(0, 6),
-            pady=(4, 0),
         )
         tk_entry(
-            self.resin_frame,
+            self.resin_ssh_frame,
             textvariable=self.resin_ssh_host_var,
             width=24,
         ).grid(
-            row=1,
+            row=0,
             column=1,
             sticky=tk.EW,
             padx=(0, 14),
-            pady=(4, 0),
         )
-        tk_label(self.resin_frame, text="SSH 用户:", bg=UI_PANEL_BG).grid(
-            row=1,
+        tk_label(self.resin_ssh_frame, text="SSH 用户:", bg=UI_PANEL_BG).grid(
+            row=0,
             column=2,
             sticky=tk.W,
             padx=(0, 6),
-            pady=(4, 0),
         )
         tk_entry(
-            self.resin_frame,
+            self.resin_ssh_frame,
             textvariable=self.resin_ssh_user_var,
             width=18,
         ).grid(
-            row=1,
+            row=0,
             column=3,
             sticky=tk.EW,
-            pady=(4, 0),
         )
-        tk_label(self.resin_frame, text="SSH 私钥:", bg=UI_PANEL_BG).grid(
-            row=2,
+        tk_label(self.resin_ssh_frame, text="SSH 私钥:", bg=UI_PANEL_BG).grid(
+            row=1,
             column=0,
             sticky=tk.W,
             padx=(0, 6),
             pady=(4, 0),
         )
         tk_entry(
-            self.resin_frame,
+            self.resin_ssh_frame,
             textvariable=self.resin_ssh_key_var,
             width=52,
         ).grid(
-            row=2,
+            row=1,
             column=1,
             columnspan=3,
             sticky=tk.EW,
             pady=(4, 0),
         )
-        tk_label(self.resin_frame, text="本地端口:", bg=UI_PANEL_BG).grid(
-            row=3,
+        tk_label(self.resin_ssh_frame, text="本地端口:", bg=UI_PANEL_BG).grid(
+            row=2,
             column=0,
             sticky=tk.W,
             padx=(0, 6),
             pady=(4, 0),
         )
         tk_entry(
-            self.resin_frame,
+            self.resin_ssh_frame,
             textvariable=self.resin_local_port_var,
             width=12,
         ).grid(
-            row=3,
+            row=2,
             column=1,
             sticky=tk.W,
             padx=(0, 14),
             pady=(4, 0),
         )
-        tk_label(self.resin_frame, text="远端端口:", bg=UI_PANEL_BG).grid(
-            row=3,
+        tk_label(self.resin_ssh_frame, text="远端端口:", bg=UI_PANEL_BG).grid(
+            row=2,
             column=2,
             sticky=tk.W,
             padx=(0, 6),
             pady=(4, 0),
         )
         tk_entry(
-            self.resin_frame,
+            self.resin_ssh_frame,
             textvariable=self.resin_remote_port_var,
             width=12,
         ).grid(
-            row=3,
+            row=2,
             column=3,
-            sticky=tk.W,
-            pady=(4, 0),
-        )
-        tk_checkbutton(
-            self.resin_frame,
-            text="自动建立或复用 SSH 隧道",
-            variable=self.resin_enable_tunnel_var,
-        ).grid(
-            row=4,
-            column=0,
-            columnspan=4,
             sticky=tk.W,
             pady=(4, 0),
         )
@@ -3551,7 +3600,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.provider_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
+        self.provider_frame.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
         self.provider_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.provider_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -3821,7 +3870,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
         }
 
-        add_label(4, 0, "并发数（可选）:")
+        add_label(5, 0, "并发数（可选）:")
         self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
         self.workers_spinbox = tk.Spinbox(
             config_frame,
@@ -3837,15 +3886,15 @@ class GrokRegisterGUI:
             disabledforeground=UI_MUTED_FG,
             relief=tk.SOLID,
         )
-        add_field(self.workers_spinbox, 4, 1, sticky=tk.W)
+        add_field(self.workers_spinbox, 5, 1, sticky=tk.W)
 
-        add_label(4, 2, "账号间隔（秒）:")
+        add_label(5, 2, "账号间隔（秒）:")
         self.account_interval_var = tk.StringVar(
             value=str(config.get("account_interval", "60-120") or "60-120")
         )
         add_field(
             tk_entry(config_frame, textvariable=self.account_interval_var, width=20),
-            4,
+            5,
             3,
         )
 
@@ -3860,7 +3909,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.cpa_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -3996,6 +4045,10 @@ class GrokRegisterGUI:
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.proxy_mode_var.trace_add("write", lambda *_: self._refresh_proxy_fields())
+        self.resin_enable_tunnel_var.trace_add(
+            "write",
+            lambda *_: self._refresh_proxy_fields(),
+        )
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self._refresh_provider_fields()
         self._refresh_proxy_fields()
@@ -4111,12 +4164,19 @@ class GrokRegisterGUI:
         )
 
     def _refresh_proxy_fields(self):
-        """根据代理类型显示或隐藏 Resin 认证和独立 SSH 隧道配置。"""
+        """按代理类型和通道开关分级显示 Resin 认证及 SSH 连接参数。"""
         resin_enabled = "resin" in self.proxy_mode_var.get().strip().lower()
         if resin_enabled:
             self.resin_frame.grid()
+            self.resin_tunnel_check.grid()
+            if self.resin_enable_tunnel_var.get():
+                self.resin_ssh_frame.grid()
+            else:
+                self.resin_ssh_frame.grid_remove()
         else:
             self.resin_frame.grid_remove()
+            self.resin_ssh_frame.grid_remove()
+            self.resin_tunnel_check.grid_remove()
 
     def _apply_proxy_ui_config(self):
         """把 GUI 代理、Resin 身份和独立 SSH 隧道字段写回配置。"""
