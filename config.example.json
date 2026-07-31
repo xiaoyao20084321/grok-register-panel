@@ -33,7 +33,6 @@
   "resin_local_port": 12260,
   "resin_remote_port": 2260,
   "resin_tunnel_timeout": 15,
-  "enable_nsfw": false,
   "debug_mode": false,
   "close_browser_on_stop": false,
   "log_level": "info",

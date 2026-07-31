@@ -233,7 +233,6 @@ DEFAULT_CONFIG = {
     "resin_remote_port": 2260,
     # Resin 隧道超时覆盖 SSH 握手和 `/healthz` 首次响应。
     "resin_tunnel_timeout": 15,
-    "enable_nsfw": True,
     "debug_mode": False,
     "close_browser_on_stop": False,
     "log_level": "info",
@@ -1332,6 +1331,102 @@ def _parse_grok2api_import_stream(response, operation: str) -> dict:
     raise RuntimeError(f"{operation}未返回 complete 事件")
 
 
+def _run_grok2api_web_account_tools_background(
+    base_url: str,
+    username: str,
+    password: str,
+    email: str,
+) -> None:
+    """后台定位刚导入的 Web 账号并执行协议、生日和 NSFW，忽略所有结果。"""
+    base = str(base_url or "").strip().rstrip("/")
+    target_email = str(email or "").strip()
+    if not base or not target_email:
+        return
+    try:
+        access_token = _get_grok2api_admin_token(base, username, password)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get(
+            f"{base}/api/admin/v1/accounts",
+            headers=headers,
+            params={
+                "page": "1",
+                "pageSize": "20",
+                "provider": "grok_web",
+                "search": target_email,
+            },
+            timeout=30,
+            proxies={},
+            impersonate="chrome",
+        )
+        if response.status_code == 401:
+            _invalidate_grok2api_admin_token(base, username, password)
+            return
+        if response.status_code >= 400:
+            return
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return
+        account_id = ""
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_email = str(item.get("email") or "").strip()
+            item_name = str(item.get("name") or "").strip()
+            if target_email.casefold() not in {
+                item_email.casefold(),
+                item_name.casefold(),
+            }:
+                continue
+            if str(item.get("provider") or "") != "grok_web":
+                continue
+            account_id = str(item.get("id") or "").strip()
+            if account_id:
+                break
+        if not account_id:
+            return
+        response = requests.post(
+            f"{base}/api/admin/v1/accounts/web/run-scripts",
+            headers={
+                **headers,
+                "Accept": "text/event-stream",
+            },
+            json={
+                "ids": [account_id],
+                "actions": {
+                    "acceptTerms": True,
+                    "setBirthDate": True,
+                    "enableNSFW": True,
+                },
+            },
+            # 后台保持 SSE 连接，主注册流程不等待任务完成。
+            timeout=600,
+            proxies={},
+            impersonate="chrome",
+        )
+        if response.status_code == 401:
+            _invalidate_grok2api_admin_token(base, username, password)
+    except Exception:
+        # 账号工具属于尽力而为的后台附加动作，任何失败都不得影响注册结果。
+        return
+
+
+def _start_grok2api_web_account_tools_background(
+    base_url: str,
+    username: str,
+    password: str,
+    email: str,
+) -> None:
+    """启动守护线程执行 Grok2API Web 账号工具，不阻塞当前上传线程。"""
+    threading.Thread(
+        target=_run_grok2api_web_account_tools_background,
+        args=(base_url, username, password, email),
+        name="grok2api-web-account-tools",
+        daemon=True,
+    ).start()
+
+
 def upload_grok2api_document_remote(
     base_url: str,
     username: str,
@@ -1368,7 +1463,23 @@ def upload_grok2api_document_remote(
         multipart.close()
     if response.status_code == 401:
         _invalidate_grok2api_admin_token(base, username, password)
-    return _parse_grok2api_import_stream(response, "Grok2API 账号导入")
+    result = _parse_grok2api_import_stream(response, "Grok2API 账号导入")
+    if endpoint.rstrip("/") == "/api/admin/v1/accounts/web/import":
+        accounts = document.get("accounts") if isinstance(document, dict) else None
+        web_account = accounts[0] if isinstance(accounts, list) and accounts else None
+        email = (
+            str(web_account.get("email") or "").strip()
+            if isinstance(web_account, dict)
+            else ""
+        )
+        if email:
+            _start_grok2api_web_account_tools_background(
+                base,
+                username,
+                password,
+                email,
+            )
+    return result
 
 
 def _run_remote_upload_with_retries(
@@ -3300,13 +3411,35 @@ class GrokRegisterGUI:
         )
         add_field(self.email_provider_combo, 1, 1, sticky=tk.W)
 
-        add_label(0, 2, "注册数量:")
+        add_label(0, 0, "注册选项:")
+        # opt_frame 集中展示调试项及整批注册的数量、并发和账号间隔。
+        opt_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        add_field(opt_frame, 0, 1, columnspan=3, sticky=tk.EW)
+        # debug_mode_var 控制单账号调试模式，启用时强制数量和并发均为一。
+        self.debug_mode_var = tk.BooleanVar(value=bool(config.get("debug_mode", False)))
+        # debug_mode_check 允许在 GUI 顶部快速切换调试运行方式。
+        self.debug_mode_check = tk_checkbutton(
+            opt_frame, text="调试模式（可选）", variable=self.debug_mode_var
+        )
+        self.debug_mode_check.pack(side=tk.LEFT)
+        # log_level_var 保存当前批次的日志详细程度。
+        self.log_level_var = tk.StringVar(value=str(config.get("log_level", "info") or "info"))
+        tk_label(opt_frame, text="日志:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
+        # log_level_combo 提供 info 与 debug 两种日志等级。
+        self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
+        self.log_level_combo.pack(side=tk.LEFT)
+        tk_label(opt_frame, text="注册数量:", bg=UI_PANEL_BG).pack(
+            side=tk.LEFT,
+            padx=(14, 4),
+        )
+        # count_var 保存本批次需要完成的账号总数。
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
+        # count_spinbox 限制 GUI 单批次注册数量的输入范围。
         self.count_spinbox = tk.Spinbox(
-            config_frame,
+            opt_frame,
             from_=1,
             to=2500,
-            width=8,
+            width=6,
             textvariable=self.count_var,
             bg=UI_ENTRY_BG,
             fg=UI_FG,
@@ -3316,23 +3449,44 @@ class GrokRegisterGUI:
             disabledforeground=UI_MUTED_FG,
             relief=tk.SOLID,
         )
-        add_field(self.count_spinbox, 0, 3, sticky=tk.W)
-
-        add_label(0, 0, "注册选项:")
-        opt_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
-        add_field(opt_frame, 0, 1, sticky=tk.W)
-        self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = tk_checkbutton(opt_frame, text="注册后开启 NSFW（可选）", variable=self.nsfw_var)
-        self.nsfw_check.pack(side=tk.LEFT)
-        self.debug_mode_var = tk.BooleanVar(value=bool(config.get("debug_mode", False)))
-        self.debug_mode_check = tk_checkbutton(
-            opt_frame, text="调试模式（可选）", variable=self.debug_mode_var
+        self.count_spinbox.pack(side=tk.LEFT)
+        tk_label(opt_frame, text="并发数:", bg=UI_PANEL_BG).pack(
+            side=tk.LEFT,
+            padx=(14, 4),
         )
-        self.debug_mode_check.pack(side=tk.LEFT, padx=(12, 0))
-        self.log_level_var = tk.StringVar(value=str(config.get("log_level", "info") or "info"))
-        tk_label(opt_frame, text="日志:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
-        self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
-        self.log_level_combo.pack(side=tk.LEFT)
+        # workers_var 保存完整账号流程并行运行的 worker 数量。
+        self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
+        # workers_spinbox 将 GUI 并发输入限制在浏览器工作线程的安全范围内。
+        self.workers_spinbox = tk.Spinbox(
+            opt_frame,
+            from_=1,
+            to=8,
+            width=5,
+            textvariable=self.workers_var,
+            bg=UI_ENTRY_BG,
+            fg=UI_FG,
+            insertbackground=UI_FG,
+            buttonbackground=UI_BUTTON_BG,
+            disabledbackground="#2f2f2f",
+            disabledforeground=UI_MUTED_FG,
+            relief=tk.SOLID,
+        )
+        self.workers_spinbox.pack(side=tk.LEFT)
+        tk_label(opt_frame, text="账号间隔（秒）:", bg=UI_PANEL_BG).pack(
+            side=tk.LEFT,
+            padx=(14, 4),
+        )
+        # account_interval_var 保存每个 worker 完成一轮后等待的固定值或随机区间。
+        self.account_interval_var = tk.StringVar(
+            value=str(config.get("account_interval", "60-120") or "60-120")
+        )
+        # account_interval_entry 接收整数或“最小值-最大值”格式的等待秒数。
+        self.account_interval_entry = tk_entry(
+            opt_frame,
+            textvariable=self.account_interval_var,
+            width=11,
+        )
+        self.account_interval_entry.pack(side=tk.LEFT)
 
         # proxy_var 保存普通代理与 Resin 共用的代理入口地址。
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -3878,34 +4032,6 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
         }
 
-        add_label(5, 0, "并发数（可选）:")
-        self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
-        self.workers_spinbox = tk.Spinbox(
-            config_frame,
-            from_=1,
-            to=8,
-            width=8,
-            textvariable=self.workers_var,
-            bg=UI_ENTRY_BG,
-            fg=UI_FG,
-            insertbackground=UI_FG,
-            buttonbackground=UI_BUTTON_BG,
-            disabledbackground="#2f2f2f",
-            disabledforeground=UI_MUTED_FG,
-            relief=tk.SOLID,
-        )
-        add_field(self.workers_spinbox, 5, 1, sticky=tk.W)
-
-        add_label(5, 2, "账号间隔（秒）:")
-        self.account_interval_var = tk.StringVar(
-            value=str(config.get("account_interval", "60-120") or "60-120")
-        )
-        add_field(
-            tk_entry(config_frame, textvariable=self.account_interval_var, width=20),
-            5,
-            3,
-        )
-
         # SSO → CPA auth 可选
         self.cpa_frame = tk.LabelFrame(
             config_frame,
@@ -3917,7 +4043,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.cpa_frame.grid(row=6, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -4405,7 +4531,6 @@ class GrokRegisterGUI:
             return
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
-        config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["debug_mode"] = bool(self.debug_mode_var.get())
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
         config["log_level"] = (self.log_level_var.get().strip() or "info").lower()
@@ -4858,18 +4983,6 @@ class GrokRegisterGUI:
                         log_callback=wlog, cancel_callback=self.should_stop
                     )
                     ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
-                    if config.get("enable_nsfw", True):
-                        wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
-                        try:
-                            nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                                sso, log_callback=wlog
-                            )
-                            if nsfw_ok:
-                                wlog(f"[+] NSFW 开启成功: {nsfw_msg}")
-                            else:
-                                wlog(f"[!] NSFW 自动开启失败（账号仍可用，可网页手动开）: {nsfw_msg}")
-                        except Exception as nsfw_exc:
-                            wlog(f"[!] NSFW 步骤异常，已跳过: {nsfw_exc}")
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         # 以邮箱命名单独保存
@@ -5271,11 +5384,6 @@ def run_registration_cli(count):
                             email=email,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
-                        if config.get("enable_nsfw", True):
-                            enable_nsfw_for_token(
-                                sso,
-                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            )
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         try:
                             with accounts_lock:
@@ -5665,15 +5773,6 @@ def run_registration_cli(count):
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
                 ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
                     # 以邮箱命名单独保存
