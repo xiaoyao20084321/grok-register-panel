@@ -3125,17 +3125,109 @@ class GrokRegisterGUI:
         except (tk.TclError, RuntimeError):
             pass
 
+    def _on_config_mousewheel(self, event):
+        """仅当指针位于配置视口内时滚动配置 Canvas，兼容各平台滚轮事件。"""
+        try:
+            canvas = self.config_canvas
+            pointer_x = int(getattr(event, "x_root", -1))
+            pointer_y = int(getattr(event, "y_root", -1))
+            left = canvas.winfo_rootx()
+            top = canvas.winfo_rooty()
+            right = left + canvas.winfo_width()
+            bottom = top + canvas.winfo_height()
+            if not (left <= pointer_x < right and top <= pointer_y < bottom):
+                return None
+
+            event_number = int(getattr(event, "num", 0) or 0)
+            if event_number == 4:
+                units = -1
+            elif event_number == 5:
+                units = 1
+            else:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if delta == 0:
+                    return None
+                divisor = 120 if abs(delta) >= 120 else 1
+                units = -int(delta / divisor)
+                units = max(-4, min(4, units))
+
+            scroll_region = canvas.bbox("all")
+            if (
+                scroll_region is None
+                or scroll_region[3] - scroll_region[1]
+                <= canvas.winfo_height()
+            ):
+                return None
+            canvas.yview_scroll(units, "units")
+            return "break"
+        except (tk.TclError, ValueError, TypeError):
+            return None
+
+    def _on_config_content_resize(self, _event=None):
+        """在配置字段显隐或尺寸变化后刷新 Canvas 的纵向滚动范围。"""
+        try:
+            scroll_region = self.config_canvas.bbox("all")
+            if scroll_region is not None:
+                self.config_canvas.configure(scrollregion=scroll_region)
+                if (
+                    scroll_region[3] - scroll_region[1]
+                    <= self.config_canvas.winfo_height()
+                ):
+                    self.config_canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _on_config_canvas_resize(self, event):
+        """让 Canvas 内部配置面板始终铺满可见宽度，避免出现横向滚动。"""
+        try:
+            self.config_canvas.itemconfigure(
+                self._config_canvas_window,
+                width=max(int(event.width), 1),
+            )
+            self._on_config_content_resize()
+        except (tk.TclError, ValueError, TypeError):
+            pass
+
     def setup_ui(self):
-        """根据配置构建主界面，并按邮箱 provider 切换专属字段。"""
+        """构建带滚动配置视口的主界面，并按邮箱 provider 切换专属字段。"""
         load_config()
         _wire_runtime_modules()
         main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.grid_columnconfigure(0, weight=1)
-        main_frame.grid_rowconfigure(3, weight=1)
+        main_frame.grid_rowconfigure(0, weight=3, minsize=280)
+        main_frame.grid_rowconfigure(3, weight=2, minsize=180)
 
+        config_scroll_host = tk.Frame(main_frame, bg=UI_BG)
+        config_scroll_host.grid(
+            row=0,
+            column=0,
+            sticky=tk.NSEW,
+            pady=(0, 8),
+        )
+        config_scroll_host.grid_columnconfigure(0, weight=1)
+        config_scroll_host.grid_rowconfigure(0, weight=1)
+        # config_canvas 限制配置区的请求高度，让底部日志始终获得可见空间。
+        self.config_canvas = tk.Canvas(
+            config_scroll_host,
+            bg=UI_PANEL_BG,
+            highlightthickness=0,
+            borderwidth=0,
+            height=400,
+        )
+        self.config_canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        # config_scrollbar 只控制上方配置视口，不影响日志框自己的滚动条。
+        self.config_scrollbar = ttk.Scrollbar(
+            config_scroll_host,
+            orient=tk.VERTICAL,
+            command=self.config_canvas.yview,
+        )
+        self.config_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        self.config_canvas.configure(
+            yscrollcommand=self.config_scrollbar.set,
+        )
         config_frame = tk.LabelFrame(
-            main_frame,
+            self.config_canvas,
             text="配置",
             bg=UI_PANEL_BG,
             fg=UI_FG,
@@ -3144,9 +3236,31 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        config_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        # _config_canvas_window 保存内部面板的 Canvas item，窗口缩放时同步宽度。
+        self._config_canvas_window = self.config_canvas.create_window(
+            (0, 0),
+            window=config_frame,
+            anchor=tk.NW,
+        )
         config_frame.grid_columnconfigure(1, weight=1, minsize=260)
         config_frame.grid_columnconfigure(3, weight=1, minsize=260)
+        config_frame.bind("<Configure>", self._on_config_content_resize)
+        self.config_canvas.bind("<Configure>", self._on_config_canvas_resize)
+        self.root.bind_all(
+            "<MouseWheel>",
+            self._on_config_mousewheel,
+            add="+",
+        )
+        self.root.bind_all(
+            "<Button-4>",
+            self._on_config_mousewheel,
+            add="+",
+        )
+        self.root.bind_all(
+            "<Button-5>",
+            self._on_config_mousewheel,
+            add="+",
+        )
 
         def add_label(row, column, text):
             tk_label(config_frame, text=text, bg=UI_PANEL_BG).grid(
