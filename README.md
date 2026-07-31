@@ -97,10 +97,19 @@ cp config.example.json config.json
 | `proxies.txt` | 可选；多行代理，多 worker 轮换端口 |
 | `register_workers` | 并发浏览器数（建议先 2～3） |
 | `register_count` | 单次目标数量 |
-| `cpa_auto_add` | 是否 SSO→OAuth 并写入 auth |
-| `cpa_auth_dir` | 本地 CPA 目录（`xai-*.json`） |
-| `grok2api_auth_dir` | Grok2API Grok Build 管理后台可导入的 `accounts` JSON 目录 |
-| `cpa_remote_url` / `cpa_management_key` | 远程 CPA Management API（可选） |
+| `cpa_auto_add` | SSO→OAuth 与 auth 输出总开关 |
+| `cpa_enabled` / `grok2api_enabled` | 独立选择 CPA、Grok2API 输出；默认都开启 |
+| `cpa_remote_url` / `cpa_management_key` | CPA Management API 地址与管理密钥 |
+| `cpa_auth_dir` | CPA 远程交付最终失败时保存 `xai-*.json` 的本地备用目录 |
+| `grok2api_remote_url` | Grok2API 管理后台基础地址 |
+| `grok2api_admin_username` / `grok2api_admin_password` | Grok2API 管理员登录信息 |
+| `grok2api_auth_dir` | Grok2API 远程交付最终失败时保存 Web/Build 导入 JSON 的本地备用目录 |
+
+开启 auth 输出后，每个远程上传首次失败会额外重试 3 次，仍失败才写入对应
+本地备用目录。程序会先完成 OAuth 换取和导入文档转换，再并行交付 CPA、
+Grok2API Web SSO 与 Grok2API Build OAuth；Web 与 Build 使用两个独立接口和
+独立重试链。OAuth 换取失败时，会在换取流程结束后单独交付已经取得的 Web SSO。
+未勾选的输出目标不会上传，也不会生成本地备用文件。
 
 ### iCloud Hide My Email
 
@@ -322,6 +331,7 @@ A: 看 `log/orch100-stdout.log` 与最新 `log/batch-*.log`；欢迎提 issue / 
 - **必须**设置 `MONITOR_TOKEN`；不要把 token 提交进仓库或贴进公开 issue  
 - **不要提交** `config.json`、`accounts/`、`cpa_auth/`、`proxies.txt`、真实 stickies、`log/monitor.token`  
 - `.gitignore` 已忽略上述路径  
+- CPA 管理密钥与 Grok2API 管理密码只放在 `config.json`；GUI 和运行日志会隐藏明文
 - 代理凭据与邮箱在结果 JSONL / 控制台走 `redact_proxy` / `mask_email`  
 - 新写 auth 文件权限 0600、父目录 0700（`sso_to_auth_json`）  
 - 开源前自查：`grep -R api_key --include='*.json' .`（勿提交真实配置）  

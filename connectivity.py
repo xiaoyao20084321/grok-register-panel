@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""启动前连通性检查：代理 / 邮箱 API / CPA。"""
+"""启动前连通性检查：代理、邮箱 API、CPA 与 Grok2API。"""
 from __future__ import annotations
 
 import socket
@@ -234,26 +234,45 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
 
 
 def check_cpa(config: dict, http_get: Callable) -> CheckResult:
+    """检查已勾选 auth 输出的远程服务和本地备用目录是否可用。"""
     if not config.get("cpa_auto_add"):
-        return "CPA", True, "未开启 SSO→auth（跳过）"
+        return "CPA/Grok2API", True, "未开启 SSO→auth（跳过）"
+
+    cpa_enabled = bool(config.get("cpa_enabled", True))
+    grok2api_enabled = bool(config.get("grok2api_enabled", True))
+    if not cpa_enabled and not grok2api_enabled:
+        return "CPA/Grok2API", True, "未勾选输出目标（跳过）"
+
     auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
-    remote = str(config.get("cpa_remote_url", "") or "").strip()
-    key = str(config.get("cpa_management_key", "") or "").strip()
-    g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
+    cpa_remote = str(config.get("cpa_remote_url", "") or "").strip()
+    cpa_key = str(config.get("cpa_management_key", "") or "").strip()
+    grok2api_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
+    grok2api_remote = str(
+        config.get("grok2api_remote_url", "") or ""
+    ).strip()
+    grok2api_username = str(
+        config.get("grok2api_admin_username", "") or ""
+    ).strip()
+    grok2api_password = str(
+        config.get("grok2api_admin_password", "") or ""
+    )
 
     # 相对路径基于项目根目录解析（与 grok_register_ttk.py 的 APP_DIR 一致）
     import os as _os
     _app_dir = _os.path.dirname(_os.path.abspath(__file__))
     if auth_dir and not _os.path.isabs(auth_dir):
         auth_dir = _os.path.join(_app_dir, auth_dir)
-    if g2a_dir and not _os.path.isabs(g2a_dir):
-        g2a_dir = _os.path.join(_app_dir, g2a_dir)
+    if grok2api_dir and not _os.path.isabs(grok2api_dir):
+        grok2api_dir = _os.path.join(_app_dir, grok2api_dir)
 
-    if not auth_dir and not remote and not g2a_dir:
-        return "CPA", False, "已开启但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录"
+    if cpa_enabled and not auth_dir and not cpa_remote:
+        return "CPA/Grok2API", False, "已勾选 CPA，但未配置服务器地址或本地备用目录"
+    if grok2api_enabled and not grok2api_dir and not grok2api_remote:
+        return "CPA/Grok2API", False, "已勾选 Grok2API，但未配置服务器地址或本地备用目录"
+
     parts = []
     import os
-    if auth_dir:
+    if cpa_enabled and auth_dir:
         if os.path.isdir(auth_dir):
             parts.append("CPA本地目录OK")
         else:
@@ -262,42 +281,66 @@ def check_cpa(config: dict, http_get: Callable) -> CheckResult:
                 os.makedirs(auth_dir, exist_ok=True)
                 parts.append("CPA本地目录已创建")
             except Exception as exc:
-                return "CPA", False, f"CPA auth 目录不存在且无法创建: {auth_dir} ({exc})"
-    if g2a_dir:
-        if os.path.isdir(g2a_dir):
-            parts.append("Grok2API目录OK")
+                return "CPA/Grok2API", False, f"CPA 本地备用目录无法创建: {auth_dir} ({exc})"
+
+    if grok2api_enabled and grok2api_dir:
+        if os.path.isdir(grok2api_dir):
+            parts.append("Grok2API本地目录OK")
         else:
             try:
-                os.makedirs(g2a_dir, exist_ok=True)
-                parts.append("Grok2API目录已创建")
+                os.makedirs(grok2api_dir, exist_ok=True)
+                parts.append("Grok2API本地目录已创建")
             except Exception as exc:
-                return "CPA", False, f"Grok2API 目录不存在且无法创建: {g2a_dir} ({exc})"
-    if remote:
-        if not key:
-            return "CPA", False, "已配远程地址但缺少管理密钥"
+                return "CPA/Grok2API", False, f"Grok2API 本地备用目录无法创建: {grok2api_dir} ({exc})"
+
+    if cpa_enabled and cpa_remote:
+        if not cpa_key:
+            return "CPA/Grok2API", False, "已配置 CPA 服务器地址但缺少管理密钥"
         try:
-            u = urlparse(remote)
+            u = urlparse(cpa_remote)
             host = u.hostname or "127.0.0.1"
             port = u.port or (443 if u.scheme == "https" else 80)
             if not _tcp_open(host, port):
-                return "CPA", False, f"远程不可达 {host}:{port}"
-            base = remote.rstrip("/")
+                return "CPA/Grok2API", False, f"CPA 服务器不可达 {host}:{port}"
+            base = cpa_remote.rstrip("/")
             # 管理 API 列表
             resp = http_get(
                 f"{base}/v0/management/auth-files",
-                headers={"Authorization": f"Bearer {key}"},
+                headers={"Authorization": f"Bearer {cpa_key}"},
                 timeout=8,
-                proxies={},  # CPA 一般本机
+                proxies={},  # 管理端上传默认直连，不复用注册代理
                 impersonate="chrome",
             )
             if resp.status_code in (401, 403):
-                return "CPA", False, f"管理密钥无效 HTTP {resp.status_code}"
-            if resp.status_code >= 500:
-                return "CPA", False, f"CPA 服务异常 HTTP {resp.status_code}"
-            parts.append(f"远程OK HTTP {resp.status_code}")
+                return "CPA/Grok2API", False, f"CPA 管理密钥无效 HTTP {resp.status_code}"
+            if resp.status_code >= 400:
+                return "CPA/Grok2API", False, f"CPA 管理接口异常 HTTP {resp.status_code}"
+            parts.append(f"CPA远程OK HTTP {resp.status_code}")
         except Exception as exc:
-            return "CPA", False, f"远程探测失败: {exc}"
-    return "CPA", True, "；".join(parts) if parts else "OK"
+            return "CPA/Grok2API", False, f"CPA 远程探测失败: {exc}"
+
+    if grok2api_enabled and grok2api_remote:
+        if not grok2api_username or not grok2api_password:
+            return "CPA/Grok2API", False, "已配置 Grok2API 服务器地址但缺少管理员账号或密码"
+        try:
+            u = urlparse(grok2api_remote)
+            host = u.hostname or "127.0.0.1"
+            port = u.port or (443 if u.scheme == "https" else 80)
+            if not _tcp_open(host, port):
+                return "CPA/Grok2API", False, f"Grok2API 服务器不可达 {host}:{port}"
+            response = http_get(
+                f"{grok2api_remote.rstrip('/')}/healthz",
+                timeout=8,
+                proxies={},
+                impersonate="chrome",
+            )
+            if response.status_code != 200:
+                return "CPA/Grok2API", False, f"Grok2API 健康检查异常 HTTP {response.status_code}"
+            parts.append(f"Grok2API远程可达 HTTP {response.status_code}")
+        except Exception as exc:
+            return "CPA/Grok2API", False, f"Grok2API 远程探测失败: {exc}"
+
+    return "CPA/Grok2API", True, "；".join(parts) if parts else "OK"
 
 
 def run_connectivity_checks(config: dict, http_get: Callable, http_post: Callable) -> List[CheckResult]:
