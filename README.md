@@ -94,6 +94,9 @@ cp config.example.json config.json
 | `proxy_mode` | `normal`（普通代理，默认）或 `resin`（Resin 粘性代理） |
 | `proxy` | 默认 HTTP 代理，如 `http://127.0.0.1:7890` |
 | `resin_token` / `resin_platform` | Resin 正向代理密码与节点平台；Platform 默认 `Default` |
+| `resin_enable_tunnel` | Resin 模式下自动建立或复用独立 SSH 本地端口转发 |
+| `resin_ssh_key` / `resin_ssh_user` / `resin_ssh_host` | Resin 部署服务器的 SSH 私钥、用户和主机，与邮箱服务商配置相互独立 |
+| `resin_local_port` / `resin_remote_port` | Resin 本地转发端口与服务器回环地址上的服务端口，默认 `12260 → 2260` |
 | `proxies.txt` | 可选；多行代理，多 worker 轮换端口 |
 | `register_workers` | 并发浏览器数（建议先 2～3） |
 | `register_count` | 单次目标数量 |
@@ -131,9 +134,18 @@ App 专用密码只保存在服务器端 `icloud-hme/data/accounts.json`，不�
 ### Resin 粘性代理
 
 GUI 的代理类型默认为“普通代理”。选择“Resin 粘性代理”后，代理地址仍填写
-统一入口（例如 `http://127.0.0.1:2260`），并额外填写 Resin Token 和
-Platform。注册机按 Resin V1 的 `Platform.Account:Token` 格式为每个 Grok
-账号生成独立 Account。
+统一入口，并额外填写 Resin Token、Platform 和可选的独立 SSH 隧道字段。
+本机直接运行 Resin 时可关闭自动隧道并填写 `http://127.0.0.1:2260`；Resin
+只监听云服务器回环地址时，开启自动隧道并填写
+`http://127.0.0.1:12260`。注册机按 Resin V1 的
+`Platform.Account:Token` 格式为每个 Grok 账号生成独立 Account。
+
+自动隧道开启后，注册机会在连通性检查前执行等价于
+`ssh -N -L 12260:127.0.0.1:2260` 的端口转发，并自动把私钥权限设置为
+`0400`。本地 `/healthz` 已可访问时会直接复用现有隧道；端口被非 Resin
+程序占用、SSH 提前退出或超时都会给出明确错误并停止启动。邮箱未选择 iCloud
+时也可独立使用这些 Resin SSH 字段。程序退出时只关闭自己创建的隧道，不会
+终止用户手动建立的 SSH 进程。
 
 同一个账号的注册页、Turnstile、风控检查、NSFW 设置和 OAuth 换 token
 始终复用相同 Resin Account；验证码换邮箱、浏览器重启或同槽位重试不会改变
@@ -279,6 +291,7 @@ python grok_register_ttk.py
 ├── grok_register_ttk.py       # GUI + CLI 主程序
 ├── register_flow.py           # 注册页流程 / Turnstile
 ├── browser_session.py         # 会话、出口探测、ASN 黑名单
+├── resin_tunnel.py            # Resin 独立 SSH 隧道复用、健康检查与清理
 ├── sso_to_auth_json.py        # SSO → OAuth / 写 CPA（auth 文件 0600）
 ├── camoufox_adapter.py
 ├── connectivity.py

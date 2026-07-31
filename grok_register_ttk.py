@@ -48,6 +48,7 @@ from email_providers.common import pick_list_payload as _pick_list
 import browser_session as _bs
 import register_flow as _rf
 import connectivity as _conn
+import resin_tunnel as _resin_tunnel
 from browser_session import (
 
     browser,
@@ -218,6 +219,20 @@ DEFAULT_CONFIG = {
     "resin_token": "",
     # Resin 默认平台包含全部已导入节点，可在 GUI 中切换到自定义平台。
     "resin_platform": "Default",
+    # Resin 自动隧道默认关闭；已有 iCloud SSH 主机的旧配置会在加载时自动启用。
+    "resin_enable_tunnel": False,
+    # Resin SSH 私钥与 iCloud 可使用相同文件，但配置项保持相互独立。
+    "resin_ssh_key": "~/.ssh/MaXiangLinTxCloudMiYao.pem",
+    # Resin SSH 用户对应部署服务的云服务器系统账号。
+    "resin_ssh_user": "ubuntu",
+    # Resin SSH 主机默认留空，旧配置首次加载时可从 iCloud 主机迁移。
+    "resin_ssh_host": "",
+    # Resin 本地端口是程序实际连接的 SSH 转发入口。
+    "resin_local_port": 12260,
+    # Resin 远端端口对应云服务器回环地址上的 Resin 服务。
+    "resin_remote_port": 2260,
+    # Resin 隧道超时覆盖 SSH 握手和 `/healthz` 首次响应。
+    "resin_tunnel_timeout": 15,
     "enable_nsfw": True,
     "debug_mode": False,
     "close_browser_on_stop": False,
@@ -504,12 +519,49 @@ def format_fail_stats(stats: dict) -> str:
 
 
 def load_config():
+    """加载用户配置，并为首次出现的 Resin 隧道字段迁移 iCloud SSH 参数。"""
     global config
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             config = {**DEFAULT_CONFIG, **loaded}
+            # 旧配置没有 Resin SSH 字段时，优先沿用用户已经确认可用的 iCloud
+            # 服务器、账号和私钥；写回 config.json 后两组字段仍可独立修改。
+            resin_ssh_fallbacks = {
+                "resin_ssh_key": "icloud_ssh_key",
+                "resin_ssh_user": "icloud_ssh_user",
+                "resin_ssh_host": "icloud_ssh_host",
+            }
+            for resin_key, icloud_key in resin_ssh_fallbacks.items():
+                if resin_key not in loaded and str(loaded.get(icloud_key, "") or ""):
+                    config[resin_key] = loaded[icloud_key]
+            if "resin_enable_tunnel" not in loaded:
+                config["resin_enable_tunnel"] = bool(
+                    str(config.get("resin_ssh_host", "") or "").strip()
+                )
+
+            # 用户原来直连本机 Resin 的 2260 端口时，首次启用自动隧道自动迁移
+            # 到 12260；其他自定义代理地址保持原样，避免覆盖用户选择。
+            if (
+                "resin" in str(config.get("proxy_mode", "") or "").lower()
+                and bool(config.get("resin_enable_tunnel"))
+                and "resin_local_port" not in loaded
+            ):
+                try:
+                    parsed_proxy = urlsplit(str(config.get("proxy", "") or ""))
+                    if (
+                        parsed_proxy.hostname
+                        in ("127.0.0.1", "localhost", "::1")
+                        and parsed_proxy.port
+                        == int(config.get("resin_remote_port", 2260) or 2260)
+                    ):
+                        config["proxy"] = (
+                            "http://127.0.0.1:"
+                            f"{int(config.get('resin_local_port', 12260) or 12260)}"
+                        )
+                except (TypeError, ValueError):
+                    pass
         except Exception:
             config = DEFAULT_CONFIG.copy()
     return config
@@ -635,6 +687,36 @@ def is_resin_proxy_mode(source_config: dict | None = None) -> bool:
     return get_proxy_mode(source_config) == PROXY_MODE_RESIN
 
 
+def normalize_resin_tunnel_proxy(source_config: dict) -> str:
+    """迁移 Resin 自动隧道的旧本机入口，并返回最终代理地址。
+
+    仅当代理为空，或仍指向与远端端口相同的本机旧入口时，才改为配置的本地
+    转发端口；其他自定义地址保持不变，后续校验会提示端口是否匹配。
+    """
+    current = str(source_config.get("proxy", "") or "").strip()
+    if (
+        not is_resin_proxy_mode(source_config)
+        or not bool(source_config.get("resin_enable_tunnel", False))
+    ):
+        return current
+    try:
+        local_port = int(source_config.get("resin_local_port", 12260) or 12260)
+        remote_port = int(source_config.get("resin_remote_port", 2260) or 2260)
+        parsed = urlsplit(current) if current else None
+        should_migrate = not current or (
+            parsed is not None
+            and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+            and parsed.port == remote_port
+            and local_port != remote_port
+        )
+    except (TypeError, ValueError):
+        return current
+    if should_migrate:
+        current = f"http://127.0.0.1:{local_port}"
+        source_config["proxy"] = current
+    return current
+
+
 def validate_resin_proxy_settings(
     proxy_url: str,
     token: str,
@@ -676,15 +758,17 @@ def validate_resin_proxy_settings(
 
 
 def validate_proxy_config(source_config: dict | None = None) -> None:
-    """校验当前代理配置；普通代理保留原有宽松兼容行为。"""
+    """校验当前代理及可选 Resin SSH 隧道；普通代理保持宽松兼容。"""
     source = config if source_config is None else source_config
     if not is_resin_proxy_mode(source):
         return
+    normalize_resin_tunnel_proxy(source)
     validate_resin_proxy_settings(
         str(source.get("proxy", "") or ""),
         str(source.get("resin_token", "") or ""),
         str(source.get("resin_platform", RESIN_DEFAULT_PLATFORM) or ""),
     )
+    _resin_tunnel.validate_config(source)
 
 
 def build_resin_proxy_url(
@@ -823,7 +907,8 @@ def bind_proxy_for_account(
     Resin 模式用批次、worker 和账号序号形成稳定槽位；当前槽位发生浏览器或
     邮箱重试时复用相同 Account。只有在尚未开始注册且明确要求跳过坏出口时，
     ``force_new_resin_lease`` 才会增加代次并申请新租约。启动预检成功后可通过
-    ``resin_generation`` 把对应代次交给首个注册 worker 继续复用。
+    ``resin_generation`` 把对应代次交给首个注册 worker 继续复用。自动 SSH
+    隧道若在批次运行期间断开，会在下一次账号绑定时重新建立。
     """
     if not is_resin_proxy_mode():
         proxy = pick_proxy_for_worker(worker_id, rotate_idx)
@@ -834,6 +919,8 @@ def bind_proxy_for_account(
         return proxy, ""
 
     validate_proxy_config()
+    if bool(config.get("resin_enable_tunnel", False)):
+        _resin_tunnel.ensure(config)
     slot = (
         f"{str(batch_id)}|{max(int(worker_id), 0)}|"
         f"{max(int(account_index), 0)}"
@@ -3148,7 +3235,7 @@ class GrokRegisterGUI:
         )
         add_field(self.proxy_mode_combo, 2, 1, sticky=tk.W)
 
-        # resin_frame 仅在选择 Resin 模式时显示 Token 和 Platform 输入框。
+        # resin_frame 仅在 Resin 模式显示认证、平台和独立 SSH 隧道配置。
         self.resin_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
         self.resin_frame.grid(
             row=2,
@@ -3170,6 +3257,42 @@ class GrokRegisterGUI:
                 config.get("resin_platform", RESIN_DEFAULT_PLATFORM)
                 or RESIN_DEFAULT_PLATFORM
             )
+        )
+        # resin_enable_tunnel_var 控制是否自动管理 Resin 专属 SSH 子进程。
+        self.resin_enable_tunnel_var = tk.BooleanVar(
+            value=bool(config.get("resin_enable_tunnel", False))
+        )
+        # resin_ssh_key_var 保存 Resin 隧道私钥；首次迁移可沿用 iCloud 私钥。
+        self.resin_ssh_key_var = tk.StringVar(
+            value=str(
+                config.get("resin_ssh_key", "")
+                or config.get("icloud_ssh_key", "")
+                or "~/.ssh/MaXiangLinTxCloudMiYao.pem"
+            )
+        )
+        # resin_ssh_user_var 保存部署 Resin 的云服务器登录用户。
+        self.resin_ssh_user_var = tk.StringVar(
+            value=str(
+                config.get("resin_ssh_user", "")
+                or config.get("icloud_ssh_user", "")
+                or "ubuntu"
+            )
+        )
+        # resin_ssh_host_var 保存 Resin 部署服务器，不依赖当前邮箱服务商。
+        self.resin_ssh_host_var = tk.StringVar(
+            value=str(
+                config.get("resin_ssh_host", "")
+                or config.get("icloud_ssh_host", "")
+                or ""
+            )
+        )
+        # resin_local_port_var 保存本机 Resin 隧道入口端口，默认使用 12260。
+        self.resin_local_port_var = tk.StringVar(
+            value=str(config.get("resin_local_port", 12260) or 12260)
+        )
+        # resin_remote_port_var 保存服务器回环地址上的 Resin 端口。
+        self.resin_remote_port_var = tk.StringVar(
+            value=str(config.get("resin_remote_port", 2260) or 2260)
         )
         tk_label(self.resin_frame, text="Resin Token:", bg=UI_PANEL_BG).grid(
             row=0,
@@ -3203,6 +3326,105 @@ class GrokRegisterGUI:
             width=18,
         )
         self.resin_platform_entry.grid(row=0, column=3, sticky=tk.EW)
+        tk_label(self.resin_frame, text="SSH 主机:", bg=UI_PANEL_BG).grid(
+            row=1,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 6),
+            pady=(4, 0),
+        )
+        tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_ssh_host_var,
+            width=24,
+        ).grid(
+            row=1,
+            column=1,
+            sticky=tk.EW,
+            padx=(0, 14),
+            pady=(4, 0),
+        )
+        tk_label(self.resin_frame, text="SSH 用户:", bg=UI_PANEL_BG).grid(
+            row=1,
+            column=2,
+            sticky=tk.W,
+            padx=(0, 6),
+            pady=(4, 0),
+        )
+        tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_ssh_user_var,
+            width=18,
+        ).grid(
+            row=1,
+            column=3,
+            sticky=tk.EW,
+            pady=(4, 0),
+        )
+        tk_label(self.resin_frame, text="SSH 私钥:", bg=UI_PANEL_BG).grid(
+            row=2,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 6),
+            pady=(4, 0),
+        )
+        tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_ssh_key_var,
+            width=52,
+        ).grid(
+            row=2,
+            column=1,
+            columnspan=3,
+            sticky=tk.EW,
+            pady=(4, 0),
+        )
+        tk_label(self.resin_frame, text="本地端口:", bg=UI_PANEL_BG).grid(
+            row=3,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 6),
+            pady=(4, 0),
+        )
+        tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_local_port_var,
+            width=12,
+        ).grid(
+            row=3,
+            column=1,
+            sticky=tk.W,
+            padx=(0, 14),
+            pady=(4, 0),
+        )
+        tk_label(self.resin_frame, text="远端端口:", bg=UI_PANEL_BG).grid(
+            row=3,
+            column=2,
+            sticky=tk.W,
+            padx=(0, 6),
+            pady=(4, 0),
+        )
+        tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_remote_port_var,
+            width=12,
+        ).grid(
+            row=3,
+            column=3,
+            sticky=tk.W,
+            pady=(4, 0),
+        )
+        tk_checkbutton(
+            self.resin_frame,
+            text="自动建立或复用 SSH 隧道",
+            variable=self.resin_enable_tunnel_var,
+        ).grid(
+            row=4,
+            column=0,
+            columnspan=4,
+            sticky=tk.W,
+            pady=(4, 0),
+        )
 
         # 服务商专属配置（按选择显示）
         self.provider_frame = tk.LabelFrame(
@@ -3775,7 +3997,7 @@ class GrokRegisterGUI:
         )
 
     def _refresh_proxy_fields(self):
-        """根据代理类型显示或隐藏 Resin Token 与 Platform 输入区域。"""
+        """根据代理类型显示或隐藏 Resin 认证和独立 SSH 隧道配置。"""
         resin_enabled = "resin" in self.proxy_mode_var.get().strip().lower()
         if resin_enabled:
             self.resin_frame.grid()
@@ -3783,7 +4005,7 @@ class GrokRegisterGUI:
             self.resin_frame.grid_remove()
 
     def _apply_proxy_ui_config(self):
-        """把 GUI 代理类型、统一入口、Resin Token 和 Platform 写回配置。"""
+        """把 GUI 代理、Resin 身份和独立 SSH 隧道字段写回配置。"""
         mode_text = self.proxy_mode_var.get().strip().lower()
         config["proxy_mode"] = (
             PROXY_MODE_RESIN if "resin" in mode_text else PROXY_MODE_NORMAL
@@ -3793,6 +4015,27 @@ class GrokRegisterGUI:
         config["resin_platform"] = (
             self.resin_platform_var.get().strip() or RESIN_DEFAULT_PLATFORM
         )
+        config["resin_enable_tunnel"] = bool(
+            self.resin_enable_tunnel_var.get()
+        )
+        config["resin_ssh_key"] = (
+            self.resin_ssh_key_var.get().strip()
+            or "~/.ssh/MaXiangLinTxCloudMiYao.pem"
+        )
+        config["resin_ssh_user"] = (
+            self.resin_ssh_user_var.get().strip() or "ubuntu"
+        )
+        config["resin_ssh_host"] = self.resin_ssh_host_var.get().strip()
+        config["resin_local_port"] = (
+            self.resin_local_port_var.get().strip() or "12260"
+        )
+        config["resin_remote_port"] = (
+            self.resin_remote_port_var.get().strip() or "2260"
+        )
+        normalized_proxy = normalize_resin_tunnel_proxy(config)
+        if normalized_proxy != self.proxy_var.get().strip():
+            # 首次从本机 2260 迁移到 SSH 本地端口时同步更新可见输入框。
+            self.proxy_var.set(normalized_proxy)
 
     def _apply_auth_output_ui_config(self):
         """把 GUI 中的 SSO 换取方式、输出目标和远程凭据写回配置。"""
@@ -3879,7 +4122,7 @@ class GrokRegisterGUI:
             self.eta_var.set(f"进度 {done}/{total} | {eta_text}")
 
     def run_connectivity_check(self):
-        """一键测：代理 / 邮箱 API / CPA。"""
+        """后台建立可选 Resin 隧道并检查代理、邮箱 API 和 auth 输出目标。"""
         # 先把当前 GUI 关键字段写回内存配置（不强制保存文件）
         try:
             config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
@@ -3900,6 +4143,7 @@ class GrokRegisterGUI:
             self._apply_icloud_ui_config()
             self._apply_auth_output_ui_config()
             validate_proxy_config()
+            tunnel_config = dict(config)
             check_config = connectivity_config_for_proxy()
         except Exception as exc:
             self.log(f"[!] 当前配置无法用于连通性检查: {exc}")
@@ -3910,6 +4154,11 @@ class GrokRegisterGUI:
         def _job():
             """在后台线程执行连通性检查，避免阻塞 Tk 主事件循环。"""
             try:
+                if is_resin_proxy_mode(tunnel_config):
+                    _resin_tunnel.ensure(
+                        tunnel_config,
+                        log_callback=self.log,
+                    )
                 results = _conn.run_connectivity_checks(
                     check_config,
                     http_get,
@@ -4101,12 +4350,17 @@ class GrokRegisterGUI:
         check_config,
         batch_id,
     ):
-        """在后台执行带三次 xAI 重试的启动检查，并把结果交回 Tk 主线程。"""
+        """在后台确保 Resin 隧道并执行三次 xAI 重试，再把结果交回主线程。"""
         checks = []
         error_text = ""
         startup_resin_generation = 0
         startup_attempts = 0
         try:
+            if is_resin_proxy_mode(check_config):
+                _resin_tunnel.ensure(
+                    check_config,
+                    log_callback=self.log,
+                )
             (
                 checks,
                 startup_resin_generation,
@@ -4157,6 +4411,10 @@ class GrokRegisterGUI:
         # 用户可在后台检查期间点击停止；检查返回后不得再启动浏览器。
         if self.stop_requested or not self.is_running:
             self.log("[*] 启动已取消，未进入注册流程")
+            self._set_running_ui(False)
+            return
+        if error_text:
+            self.log("[!] 启动前准备失败，已停止建号")
             self._set_running_ui(False)
             return
         if _conn.has_blocking_xai_failure(checks):
@@ -4566,7 +4824,7 @@ def cli_log(message):
 
 
 def run_registration_cli(count):
-    """执行 CLI 单线程或多线程注册，并在每次尝试后保留 iCloud 别名。"""
+    """确保可选 Resin 隧道后执行 CLI 注册，并保留每次创建的 iCloud 别名。"""
     controller = CliStopController()
     try:
         validate_proxy_config()
@@ -4633,6 +4891,11 @@ def run_registration_cli(count):
     except Exception:
         pass
     try:
+        if is_resin_proxy_mode(config):
+            _resin_tunnel.ensure(
+                config,
+                log_callback=cli_log,
+            )
         (
             startup_checks,
             startup_resin_generation,
@@ -4672,6 +4935,16 @@ def run_registration_cli(count):
             return
     except RegistrationCancelled:
         cli_log("[*] 启动检查已取消，未进入注册流程")
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        return
+    except (
+        _resin_tunnel.ResinTunnelConfigError,
+        _resin_tunnel.ResinTunnelError,
+    ) as exc:
+        cli_log(f"[!] Resin SSH 隧道不可用，已停止建号: {exc}")
         try:
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
