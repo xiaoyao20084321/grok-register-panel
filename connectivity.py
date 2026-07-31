@@ -57,7 +57,7 @@ def check_proxy(proxy_url: str, http_get: Callable) -> CheckResult:
 
 
 def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
-    """按注册浏览器同一出口检查 accounts.x.ai，CF 拦截时禁止继续建号。"""
+    """检查 accounts.x.ai，并区分代理故障、普通 HTTP 错误与 CF 挑战。"""
     proxy_url = str(proxy_url or "").strip()
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
     try:
@@ -107,10 +107,31 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
             return XAI_SIGNUP_CHECK_NAME, False, f"HTTP {status or 'unknown'}"
         return XAI_SIGNUP_CHECK_NAME, True, f"可达 HTTP {status}"
     except Exception as exc:
-        return XAI_SIGNUP_CHECK_NAME, False, str(exc)
+        detail = str(exc)
+        normalized = detail.casefold()
+        if (
+            "connect tunnel failed" in normalized
+            or "upstream_connect_failed" in normalized
+            or "upstream connect failed" in normalized
+        ):
+            return (
+                XAI_SIGNUP_CHECK_NAME,
+                False,
+                f"代理上游连接失败: {detail}",
+            )
+        if "timed out" in normalized or "timeout" in normalized:
+            return XAI_SIGNUP_CHECK_NAME, False, f"代理或 xAI 连接超时: {detail}"
+        if (
+            "connection reset" in normalized
+            or "reset by peer" in normalized
+            or "recv failure" in normalized
+        ):
+            return XAI_SIGNUP_CHECK_NAME, False, f"代理上游连接被重置: {detail}"
+        return XAI_SIGNUP_CHECK_NAME, False, f"xAI 请求异常: {detail}"
 
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
+    """判断检查结果中是否仍包含会阻止注册的 xAI 访问失败。"""
     return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
 
 

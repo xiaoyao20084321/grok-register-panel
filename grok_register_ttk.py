@@ -604,6 +604,8 @@ RESIN_FORBIDDEN_IDENTITY_CHARS = frozenset(".:|/\\@?#%~ \t\n\r")
 RESIN_RESERVED_PROXY_TOKENS = frozenset(("api", "healthz", "ui"))
 # RESIN_RESERVED_PLATFORM_NAMES 对齐 Resin 平台名称校验中的保留字。
 RESIN_RESERVED_PLATFORM_NAMES = frozenset(("api",))
+# XAI_STARTUP_CHECK_ATTEMPTS 表示启动前连续失败三次才终止注册批次。
+XAI_STARTUP_CHECK_ATTEMPTS = 3
 
 # 每个 worker 在线程本地保存当前账号的代理与 Resin 租约身份。
 _proxy_tls = threading.local()
@@ -814,12 +816,14 @@ def bind_proxy_for_account(
     *,
     rotate_idx: int = 0,
     force_new_resin_lease: bool = False,
+    resin_generation: int | None = None,
 ) -> tuple[str, str]:
     """为一个注册账号绑定代理，返回完整代理 URL 与 Resin Account。
 
     Resin 模式用批次、worker 和账号序号形成稳定槽位；当前槽位发生浏览器或
     邮箱重试时复用相同 Account。只有在尚未开始注册且明确要求跳过坏出口时，
-    ``force_new_resin_lease`` 才会增加代次并申请新租约。
+    ``force_new_resin_lease`` 才会增加代次并申请新租约。启动预检成功后可通过
+    ``resin_generation`` 把对应代次交给首个注册 worker 继续复用。
     """
     if not is_resin_proxy_mode():
         proxy = pick_proxy_for_worker(worker_id, rotate_idx)
@@ -836,10 +840,12 @@ def bind_proxy_for_account(
     )
     previous_slot = str(getattr(_proxy_tls, "resin_slot", "") or "")
     if previous_slot != slot:
-        generation = 0
+        generation = max(int(resin_generation or 0), 0)
     else:
         generation = int(getattr(_proxy_tls, "resin_generation", 0) or 0)
-        if force_new_resin_lease:
+        if resin_generation is not None:
+            generation = max(int(resin_generation), 0)
+        elif force_new_resin_lease:
             generation += 1
     account = resin_account_id(batch_id, worker_id, account_index, generation)
     proxy = build_resin_proxy_url(
@@ -1842,6 +1848,96 @@ def sleep_with_cancel(seconds, cancel_callback=None):
         if remaining <= 0:
             return
         time.sleep(min(0.2, remaining))
+
+
+def run_startup_checks_with_xai_retries(
+    source_config,
+    batch_id,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """执行启动连通性检查，并对 xAI 注册页最多重试三次。
+
+    第一次执行代理、xAI、邮箱和输出目标的完整检查；后续只重试 xAI，避免重复
+    探测无关服务。普通代理沿用同一入口重新建立请求，适配动态出口；Resin
+    每次使用新的 Account 代次。返回最终检查结果、成功或最后一次使用的 Resin
+    代次，以及实际尝试次数，供首个注册 worker 复用已验证出口。
+    """
+    checks = []
+    attempts_used = 0
+    final_generation = 0
+    resin_mode = is_resin_proxy_mode(source_config)
+
+    for attempt in range(1, XAI_STARTUP_CHECK_ATTEMPTS + 1):
+        raise_if_cancelled(cancel_callback)
+        generation = attempt - 1 if resin_mode else 0
+        final_generation = generation
+        account = (
+            resin_account_id(batch_id, 0, 0, generation)
+            if resin_mode
+            else ""
+        )
+        check_config = connectivity_config_for_proxy(source_config, account)
+        if attempt == 1:
+            checks = _conn.run_connectivity_checks(
+                check_config,
+                http_get,
+                http_post,
+            )
+        else:
+            xai_check = _conn.check_xai_signup(
+                str(check_config.get("proxy", "") or ""),
+                http_get,
+            )
+            replaced = False
+            updated_checks = []
+            for name, ok, detail in checks:
+                if name == _conn.XAI_SIGNUP_CHECK_NAME:
+                    updated_checks.append(xai_check)
+                    replaced = True
+                else:
+                    updated_checks.append((name, ok, detail))
+            if not replaced:
+                updated_checks.append(xai_check)
+            checks = updated_checks
+
+        attempts_used = attempt
+        xai_result = next(
+            (
+                item
+                for item in checks
+                if item[0] == _conn.XAI_SIGNUP_CHECK_NAME
+            ),
+            None,
+        )
+        if xai_result is None:
+            raise RuntimeError("启动检查没有返回 xAI 注册页结果")
+
+        _, xai_ok, xai_detail = xai_result
+        route_detail = (
+            f"Resin Account={account}"
+            if resin_mode
+            else "普通代理新连接"
+        )
+        if xai_ok:
+            if attempt > 1 and log_callback:
+                log_callback(
+                    f"[检查] [OK] {_conn.XAI_SIGNUP_CHECK_NAME}"
+                    f"（尝试 {attempt}/{XAI_STARTUP_CHECK_ATTEMPTS}，"
+                    f"{route_detail}）: {xai_detail}"
+                )
+            return checks, final_generation, attempts_used
+
+        if log_callback:
+            log_callback(
+                f"[检查] [FAIL] {_conn.XAI_SIGNUP_CHECK_NAME}"
+                f"（尝试 {attempt}/{XAI_STARTUP_CHECK_ATTEMPTS}，"
+                f"{route_detail}）: {xai_detail}"
+            )
+        if attempt < XAI_STARTUP_CHECK_ATTEMPTS:
+            sleep_with_cancel(1.0, cancel_callback)
+
+    return checks, final_generation, attempts_used
 
 
 def get_domains(api_key=None):
@@ -3991,36 +4087,49 @@ class GrokRegisterGUI:
         self.status_label.config(foreground="blue")
         self._stats_lock = threading.Lock()
         self._accounts_lock = threading.Lock()
-        try:
-            first_account = resin_account_id(self._proxy_batch_id, 0, 0)
-            check_config = connectivity_config_for_proxy(config, first_account)
-        except Exception as exc:
-            self.log(f"[!] 无法准备启动前连通性检查: {exc}")
-            self._set_running_ui(False)
-            return
         self.log("[*] 正在执行启动前连通性检查...")
         threading.Thread(
             target=self._run_startup_connectivity_check,
-            args=(count, workers, check_config),
+            args=(count, workers, dict(config), self._proxy_batch_id),
             daemon=True,
         ).start()
 
-    def _run_startup_connectivity_check(self, count, workers, check_config):
-        """在后台执行启动前检查，并把检查结果排入 Tk 主线程处理。"""
+    def _run_startup_connectivity_check(
+        self,
+        count,
+        workers,
+        check_config,
+        batch_id,
+    ):
+        """在后台执行带三次 xAI 重试的启动检查，并把结果交回 Tk 主线程。"""
         checks = []
         error_text = ""
+        startup_resin_generation = 0
+        startup_attempts = 0
         try:
-            checks = _conn.run_connectivity_checks(
+            (
+                checks,
+                startup_resin_generation,
+                startup_attempts,
+            ) = run_startup_checks_with_xai_retries(
                 check_config,
-                http_get,
-                http_post,
+                batch_id,
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
             )
         except Exception as exc:
             error_text = str(exc)
         self.ui_queue.put(
             (
                 self._on_startup_connectivity_done,
-                (count, workers, checks, error_text),
+                (
+                    count,
+                    workers,
+                    checks,
+                    error_text,
+                    startup_resin_generation,
+                    startup_attempts,
+                ),
             )
         )
 
@@ -4030,9 +4139,17 @@ class GrokRegisterGUI:
         workers,
         checks,
         error_text,
+        startup_resin_generation,
+        startup_attempts,
     ):
-        """在 Tk 主线程展示启动检查结果，并按原有规则决定是否开始注册。"""
+        """展示启动检查结果，失败三次时终止，否则启动并复用已验证出口。"""
         for name, ok, detail in checks:
+            # 多次重试时，后台已逐次输出 xAI 结果，此处避免重复打印最后一次。
+            if (
+                startup_attempts > 1
+                and name == _conn.XAI_SIGNUP_CHECK_NAME
+            ):
+                continue
             self.log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
         if error_text:
             self.log(f"[!] 连通性检查异常: {error_text}")
@@ -4043,7 +4160,19 @@ class GrokRegisterGUI:
             self._set_running_ui(False)
             return
         if _conn.has_blocking_xai_failure(checks):
-            self.log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+            last_detail = next(
+                (
+                    detail
+                    for name, ok, detail in checks
+                    if name == _conn.XAI_SIGNUP_CHECK_NAME and not ok
+                ),
+                "未知错误",
+            )
+            self.log(
+                f"[!] xAI 注册页启动检查连续 "
+                f"{startup_attempts or XAI_STARTUP_CHECK_ATTEMPTS} 次失败，"
+                f"已停止建号；最后原因: {last_detail}"
+            )
             self._set_running_ui(False)
             return
         if checks and not all(ok for _, ok, _ in checks):
@@ -4087,7 +4216,7 @@ class GrokRegisterGUI:
         )
         threading.Thread(
             target=self._run_registration_entry,
-            args=(count, workers),
+            args=(count, workers, startup_resin_generation),
             daemon=True,
         ).start()
 
@@ -4098,8 +4227,13 @@ class GrokRegisterGUI:
         keep = not config.get("close_browser_on_stop", False)
         self.log("[!] 用户停止注册" + ("（将保留浏览器）" if keep else "（将关闭浏览器）"))
 
-    def _run_registration_entry(self, count, workers):
-        """协调 GUI 注册 worker，并在全部分片结束后统一恢复界面状态。"""
+    def _run_registration_entry(
+        self,
+        count,
+        workers,
+        startup_resin_generation=0,
+    ):
+        """协调 GUI worker，并让首个 worker 复用启动检查通过的 Resin 代次。"""
         # 并发数不超过任务数，避免空 worker 白开浏览器
         workers = max(1, min(int(workers or 1), 24, int(count or 1)))
         # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -4109,7 +4243,12 @@ class GrokRegisterGUI:
             pass
         try:
             if workers <= 1:
-                self.run_registration(count, worker_id=0, workers=1)
+                self.run_registration(
+                    count,
+                    worker_id=0,
+                    workers=1,
+                    startup_resin_generation=startup_resin_generation,
+                )
             else:
                 base, rem = divmod(count, workers)
                 chunks = [base + (1 if i < rem else 0) for i in range(workers)]
@@ -4120,7 +4259,14 @@ class GrokRegisterGUI:
                 for wid, n in enumerate(chunks):
                     t = threading.Thread(
                         target=self.run_registration,
-                        args=(n, wid, len(chunks)),
+                        kwargs={
+                            "count": n,
+                            "worker_id": wid,
+                            "workers": len(chunks),
+                            "startup_resin_generation": (
+                                startup_resin_generation if wid == 0 else 0
+                            ),
+                        },
                         daemon=True,
                     )
                     t.start()
@@ -4137,8 +4283,14 @@ class GrokRegisterGUI:
                 + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
             )
 
-    def run_registration(self, count, worker_id=0, workers=1):
-        """在指定 GUI worker 中执行注册，并在结束时保留已创建的 iCloud 别名。"""
+    def run_registration(
+        self,
+        count,
+        worker_id=0,
+        workers=1,
+        startup_resin_generation=0,
+    ):
+        """执行 GUI 注册，并让首个账号沿用预检成功的 Resin 粘性出口。"""
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
         batch_id = str(
             getattr(self, "_proxy_batch_id", "") or new_resin_batch_id()
@@ -4157,6 +4309,11 @@ class GrokRegisterGUI:
                 batch_id,
                 worker_id,
                 i,
+                resin_generation=(
+                    startup_resin_generation
+                    if worker_id == 0 and i == 0
+                    else None
+                ),
             )
             logged_proxy_index = i
             if resin_account:
@@ -4476,24 +4633,53 @@ def run_registration_cli(count):
     except Exception:
         pass
     try:
-        first_account = resin_account_id(proxy_batch_id, 0, 0)
-        check_config = connectivity_config_for_proxy(config, first_account)
-        startup_checks = _conn.run_connectivity_checks(
-            check_config,
-            http_get,
-            http_post,
+        (
+            startup_checks,
+            startup_resin_generation,
+            startup_attempts,
+        ) = run_startup_checks_with_xai_retries(
+            dict(config),
+            proxy_batch_id,
+            log_callback=cli_log,
+            cancel_callback=controller.should_stop,
         )
         for name, ok, detail in startup_checks:
+            # 多次重试的 xAI 结果已逐次记录，仅补充其他连通性检查项。
+            if (
+                startup_attempts > 1
+                and name == _conn.XAI_SIGNUP_CHECK_NAME
+            ):
+                continue
             cli_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
         if _conn.has_blocking_xai_failure(startup_checks):
-            cli_log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+            last_detail = next(
+                (
+                    detail
+                    for name, ok, detail in startup_checks
+                    if name == _conn.XAI_SIGNUP_CHECK_NAME and not ok
+                ),
+                "未知错误",
+            )
+            cli_log(
+                f"[!] xAI 注册页启动检查连续 "
+                f"{startup_attempts or XAI_STARTUP_CHECK_ATTEMPTS} 次失败，"
+                f"已停止建号；最后原因: {last_detail}"
+            )
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
             except Exception:
                 pass
             return
+    except RegistrationCancelled:
+        cli_log("[*] 启动检查已取消，未进入注册流程")
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        return
     except Exception as exc:
         cli_log(f"[!] 启动连通性检查异常，继续注册: {exc}")
+        startup_resin_generation = 0
 
     def _cli_record_failure(exc):
         nonlocal fail_count
@@ -4524,6 +4710,11 @@ def run_registration_cli(count):
                     wid,
                     i,
                     rotate_idx=rotate_idx,
+                    resin_generation=(
+                        startup_resin_generation
+                        if wid == 0 and i == 0
+                        else None
+                    ),
                 )
                 if resin_account:
                     cli_log(
@@ -4920,6 +5111,7 @@ def run_registration_cli(count):
             proxy_batch_id,
             0,
             i,
+            resin_generation=startup_resin_generation,
         )
         logged_proxy_index = i
         if resin_account:

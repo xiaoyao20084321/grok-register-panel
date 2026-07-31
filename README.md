@@ -141,6 +141,12 @@ Platform。注册机按 Resin V1 的 `Platform.Account:Token` 格式为每个 Gr
 多并发 worker 之间的 Account 也互不重复。iCloud HME 和本地控制接口继续
 直连，不经过 Resin。
 
+启动注册前，xAI 注册页最多检查 3 次，只有连续 3 次失败才停止整批任务。
+普通代理每次通过同一入口发起新连接，兼容请求级动态出口；Resin 每次失败
+改用新的 Account 获取节点。检查成功的 Resin Account 会直接交给第一个
+Grok 账号继续使用，避免检查通过后真正注册时又切换出口。日志会区分代理
+上游连接失败、连接重置或超时，以及 Cloudflare HTTP 拦截。
+
 `resin_token` 只写入已被 `.gitignore` 忽略的 `config.json`，日志会同时遮蔽
 Token 和带认证信息的代理 URL。`config.example.json` 只保留空占位符。
 
