@@ -3126,30 +3126,27 @@ class GrokRegisterGUI:
             pass
 
     def _on_config_mousewheel(self, event):
-        """仅当指针位于配置视口内时滚动配置 Canvas，兼容各平台滚轮事件。"""
+        """将配置区鼠标滚轮或触控板事件转换为跨平台 Canvas 滚动。"""
         try:
             canvas = self.config_canvas
-            pointer_x = int(getattr(event, "x_root", -1))
-            pointer_y = int(getattr(event, "y_root", -1))
-            left = canvas.winfo_rootx()
-            top = canvas.winfo_rooty()
-            right = left + canvas.winfo_width()
-            bottom = top + canvas.winfo_height()
-            if not (left <= pointer_x < right and top <= pointer_y < bottom):
-                return None
-
-            event_number = int(getattr(event, "num", 0) or 0)
-            if event_number == 4:
+            # macOS 的 MouseWheel 事件中 num 可能是“??”，不能直接强制转成整数。
+            event_number = str(getattr(event, "num", "") or "").strip()
+            if event_number == "4":
                 units = -1
-            elif event_number == 5:
+            elif event_number == "5":
                 units = 1
             else:
-                delta = int(getattr(event, "delta", 0) or 0)
+                delta = float(getattr(event, "delta", 0) or 0)
                 if delta == 0:
                     return None
-                divisor = 120 if abs(delta) >= 120 else 1
-                units = -int(delta / divisor)
-                units = max(-4, min(4, units))
+                # Windows 常以 120 为一格；macOS 触控板通常连续发送较小 delta。
+                magnitude = (
+                    round(abs(delta) / 120)
+                    if abs(delta) >= 120
+                    else round(abs(delta))
+                )
+                magnitude = max(1, min(4, int(magnitude)))
+                units = -magnitude if delta > 0 else magnitude
 
             scroll_region = canvas.bbox("all")
             if (
@@ -3162,6 +3159,15 @@ class GrokRegisterGUI:
             return "break"
         except (tk.TclError, ValueError, TypeError):
             return None
+
+    def _bind_config_mousewheel_tree(self, widget):
+        """为配置视口及其全部子控件安装优先于控件默认行为的滚轮标签。"""
+        bindtag = self._config_mousewheel_bindtag
+        bindtags = tuple(widget.bindtags())
+        if bindtag not in bindtags:
+            widget.bindtags((bindtag, *bindtags))
+        for child in widget.winfo_children():
+            self._bind_config_mousewheel_tree(child)
 
     def _on_config_content_resize(self, _event=None):
         """在配置字段显隐或尺寸变化后刷新 Canvas 的纵向滚动范围。"""
@@ -3246,20 +3252,22 @@ class GrokRegisterGUI:
         config_frame.grid_columnconfigure(3, weight=1, minsize=260)
         config_frame.bind("<Configure>", self._on_config_content_resize)
         self.config_canvas.bind("<Configure>", self._on_config_canvas_resize)
-        self.root.bind_all(
+        # _config_mousewheel_bindtag 只拦截配置区事件，并放在默认控件绑定之前。
+        self._config_mousewheel_bindtag = f"ConfigMouseWheel-{id(self)}"
+        self.root.bind_class(
+            self._config_mousewheel_bindtag,
             "<MouseWheel>",
             self._on_config_mousewheel,
-            add="+",
         )
-        self.root.bind_all(
+        self.root.bind_class(
+            self._config_mousewheel_bindtag,
             "<Button-4>",
             self._on_config_mousewheel,
-            add="+",
         )
-        self.root.bind_all(
+        self.root.bind_class(
+            self._config_mousewheel_bindtag,
             "<Button-5>",
             self._on_config_mousewheel,
-            add="+",
         )
 
         def add_label(row, column, text):
@@ -4053,6 +4061,7 @@ class GrokRegisterGUI:
         self._refresh_provider_fields()
         self._refresh_proxy_fields()
         self._refresh_cpa_fields()
+        self._bind_config_mousewheel_tree(config_scroll_host)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
