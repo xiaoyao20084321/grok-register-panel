@@ -23,6 +23,7 @@ import re
 import string
 import json
 import base64
+from urllib.parse import quote, urlsplit, urlunsplit
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -208,7 +209,13 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # 代理模式默认保持原有普通代理行为；resin 表示按账号启用粘性身份。
+    "proxy_mode": "normal",
     "proxy": "http://127.0.0.1:7890",
+    # Resin 正向代理密码只保存在被 Git 忽略的 config.json 中。
+    "resin_token": "",
+    # Resin 默认平台包含全部已导入节点，可在 GUI 中切换到自定义平台。
+    "resin_platform": "Default",
     "enable_nsfw": True,
     "debug_mode": False,
     "close_browser_on_stop": False,
@@ -304,6 +311,18 @@ def redact_proxy(url: str) -> str:
         return _re.sub(r"://([^:/@]+):([^@/]+)@", r"://***:***@", s)
 
 
+def redact_sensitive_text(message) -> str:
+    """遮蔽日志文本中的 Resin Token，兼容原文和 URL 编码两种形态。"""
+    text = str(message)
+    token = str(config.get("resin_token", "") or "")
+    if not token:
+        return text
+    for secret_value in (token, quote(token, safe="")):
+        if secret_value:
+            text = text.replace(secret_value, "***")
+    return text
+
+
 def mask_email(email: str) -> str:
     s = str(email or "").strip()
     if "@" not in s:
@@ -378,18 +397,20 @@ def record_register_result(
         "status": status,
         "email": mask_email(email or ""),
         "kind": kind or "",
-        "detail": (detail or "")[:300],
+        "detail": redact_sensitive_text(detail or "")[:300],
         "worker": worker or "",
         "exit_ip": exit_ip,
         "proxy": redact_proxy(proxy),
         "port": port,
+        "resin_account": get_thread_resin_account(),
         "bot_flag": bot_flag,
         "risk": risk,
     }
     line = (
         f"[结果] status={status} ip={exit_ip or '?'} port={port or '?'} "
         f"email={email or '-'} kind={kind or '-'} bot={bot_flag if bot_flag is not None else '-'} "
-        f"risk={risk if risk is not None else '-'}"
+        f"risk={risk if risk is not None else '-'} "
+        f"resin={get_thread_resin_account() or '-'}"
     )
     if log_callback:
         try:
@@ -551,52 +572,207 @@ EXTENSION_PATH = ""
 DUCKMAIL_API_BASE_DEFAULT = duckmail_provider.API_BASE_DEFAULT
 
 
-# 每 worker 可绑定独立代理（Clash listener 端口），避免 8 并发挤同一 sticky
+# PROXY_MODE_NORMAL 表示直接使用用户填写的普通代理地址。
+PROXY_MODE_NORMAL = "normal"
+# PROXY_MODE_RESIN 表示使用 Resin V1 的 Platform.Account 粘性身份。
+PROXY_MODE_RESIN = "resin"
+# RESIN_DEFAULT_PLATFORM 对应 Resin 自动创建并包含全部节点的默认平台。
+RESIN_DEFAULT_PLATFORM = "Default"
+# RESIN_FORBIDDEN_IDENTITY_CHARS 与 Resin V1 对 Token、Platform 的限制保持一致。
+RESIN_FORBIDDEN_IDENTITY_CHARS = frozenset(".:|/\\@?#%~ \t\n\r")
+# RESIN_RESERVED_PROXY_TOKENS 对齐 Resin 服务启动时拒绝的路由保留字。
+RESIN_RESERVED_PROXY_TOKENS = frozenset(("api", "healthz", "ui"))
+# RESIN_RESERVED_PLATFORM_NAMES 对齐 Resin 平台名称校验中的保留字。
+RESIN_RESERVED_PLATFORM_NAMES = frozenset(("api",))
+
+# 每个 worker 在线程本地保存当前账号的代理与 Resin 租约身份。
 _proxy_tls = threading.local()
+# _proxy_pool 保存普通代理模式下从 proxies.txt 读取的代理列表。
 _proxy_pool: list = []
+# _proxy_pool_lock 保护普通代理池的重新加载，避免并发启动时读到半成品列表。
 _proxy_pool_lock = threading.Lock()
 
 
+def get_proxy_mode(source_config: dict | None = None) -> str:
+    """返回规范化代理模式；旧配置或未知值一律回落为普通代理。"""
+    source = config if source_config is None else source_config
+    raw = str(source.get("proxy_mode", PROXY_MODE_NORMAL) or PROXY_MODE_NORMAL)
+    normalized = raw.strip().lower()
+    if normalized in (
+        PROXY_MODE_RESIN,
+        "resin_sticky",
+        "resin 粘性代理",
+        "resin粘性代理",
+    ):
+        return PROXY_MODE_RESIN
+    return PROXY_MODE_NORMAL
+
+
+def is_resin_proxy_mode(source_config: dict | None = None) -> bool:
+    """判断当前配置是否启用 Resin 粘性代理。"""
+    return get_proxy_mode(source_config) == PROXY_MODE_RESIN
+
+
+def validate_resin_proxy_settings(
+    proxy_url: str,
+    token: str,
+    platform: str,
+) -> None:
+    """校验 Resin 地址和 V1 身份字段，失败时抛出可直接展示给用户的异常。"""
+    raw_proxy = str(proxy_url or "").strip()
+    raw_token = str(token or "")
+    raw_platform = str(platform or "").strip()
+    if not raw_proxy:
+        raise ValueError("Resin 粘性代理需要填写代理地址")
+    try:
+        parsed = urlsplit(raw_proxy)
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Resin 代理地址无效: {exc}") from exc
+    if parsed.scheme.lower() not in ("http", "socks5", "socks5h"):
+        raise ValueError("Resin 代理地址仅支持 http://、socks5:// 或 socks5h://")
+    if not parsed.hostname:
+        raise ValueError("Resin 代理地址缺少主机名")
+    if parsed_port is not None and not (1 <= parsed_port <= 65535):
+        raise ValueError("Resin 代理端口必须在 1-65535 之间")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Resin 代理地址不要包含认证信息，请单独填写 Token 和 Platform")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("Resin 代理地址只能填写到主机和端口，不能包含路径或查询参数")
+    if not raw_token:
+        raise ValueError("Resin 粘性代理需要填写 Resin Token")
+    if any(char in RESIN_FORBIDDEN_IDENTITY_CHARS for char in raw_token):
+        raise ValueError("Resin Token 含有 V1 不允许的符号或空白字符")
+    if raw_token in RESIN_RESERVED_PROXY_TOKENS:
+        raise ValueError("Resin Token 不能使用 api、healthz 或 ui 保留字")
+    if not raw_platform:
+        raise ValueError("Resin 粘性代理需要填写 Platform")
+    if any(char in RESIN_FORBIDDEN_IDENTITY_CHARS for char in raw_platform):
+        raise ValueError("Resin Platform 含有 V1 不允许的符号或空白字符")
+    if raw_platform.casefold() in RESIN_RESERVED_PLATFORM_NAMES:
+        raise ValueError("Resin Platform 不能使用 api 保留字")
+
+
+def validate_proxy_config(source_config: dict | None = None) -> None:
+    """校验当前代理配置；普通代理保留原有宽松兼容行为。"""
+    source = config if source_config is None else source_config
+    if not is_resin_proxy_mode(source):
+        return
+    validate_resin_proxy_settings(
+        str(source.get("proxy", "") or ""),
+        str(source.get("resin_token", "") or ""),
+        str(source.get("resin_platform", RESIN_DEFAULT_PLATFORM) or ""),
+    )
+
+
+def build_resin_proxy_url(
+    proxy_url: str,
+    token: str,
+    platform: str,
+    account: str,
+) -> str:
+    """构造 Resin V1 正向代理 URL，并对认证字段进行安全的 URL 编码。"""
+    validate_resin_proxy_settings(proxy_url, token, platform)
+    raw_account = str(account or "").strip()
+    if not raw_account:
+        raise ValueError("Resin 粘性代理缺少当前账号标识")
+    if any(char in RESIN_FORBIDDEN_IDENTITY_CHARS for char in raw_account):
+        raise ValueError("Resin Account 含有 V1 不允许的符号或空白字符")
+
+    parsed = urlsplit(str(proxy_url).strip())
+    hostname = str(parsed.hostname or "")
+    # IPv6 主机在重新组装 netloc 时必须恢复方括号，否则端口会被误解析。
+    host_text = f"[{hostname}]" if ":" in hostname else hostname
+    if parsed.port is not None:
+        host_text = f"{host_text}:{parsed.port}"
+    identity = quote(f"{str(platform).strip()}.{raw_account}", safe="")
+    encoded_token = quote(str(token), safe="")
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            f"{identity}:{encoded_token}@{host_text}",
+            "",
+            "",
+            "",
+        )
+    )
+
+
+def new_resin_batch_id(now: datetime.datetime | None = None) -> str:
+    """生成本轮注册批次标识，避免不同程序实例复用同一 Resin 租约。"""
+    current = now or datetime.datetime.now()
+    return f"{current.strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(3)}"
+
+
+def resin_account_id(
+    batch_id: str,
+    worker_id: int,
+    account_index: int,
+    generation: int = 0,
+) -> str:
+    """生成 Resin Account；同一账号槽位保持稳定，显式换租约时追加代次。"""
+    safe_batch = re.sub(r"[^A-Za-z0-9_-]+", "_", str(batch_id or "")).strip("_")
+    if not safe_batch:
+        safe_batch = new_resin_batch_id()
+    account = (
+        f"grok_{safe_batch}_w{max(int(worker_id), 0) + 1}"
+        f"_n{max(int(account_index), 0) + 1}"
+    )
+    if generation > 0:
+        account += f"_r{int(generation)}"
+    return account
+
+
 def load_proxy_pool(path: str = "") -> list:
-    """从 proxies.txt 加载 http://... 列表；空则回落 config.proxy。"""
+    """加载普通代理池；Resin 模式只使用 GUI 中填写的统一入口地址。"""
     global _proxy_pool
-    candidates = []
-    if path:
-        candidates.append(Path(path))
-    candidates.append(Path(APP_DIR) / "proxies.txt")
-    pool = []
-    for fp in candidates:
-        try:
-            if not fp.is_file():
-                continue
-            for line in fp.read_text(encoding="utf-8").splitlines():
-                s = line.strip()
-                if not s or s.startswith("#"):
+    with _proxy_pool_lock:
+        if is_resin_proxy_mode():
+            single = str(config.get("proxy", "") or "").strip()
+            _proxy_pool = [single] if single else []
+            return list(_proxy_pool)
+
+        candidates = []
+        if path:
+            candidates.append(Path(path))
+        candidates.append(Path(APP_DIR) / "proxies.txt")
+        pool = []
+        for fp in candidates:
+            try:
+                if not fp.is_file():
                     continue
-                if s.startswith("http://") or s.startswith("socks5://") or s.startswith("socks5h://"):
-                    pool.append(s)
-            if pool:
-                break
-        except Exception:
-            continue
-    if not pool:
-        single = str(config.get("proxy", "") or "").strip()
-        if single:
-            pool = [single]
-    _proxy_pool = pool
-    return pool
+                for line in fp.read_text(encoding="utf-8").splitlines():
+                    candidate = line.strip()
+                    if not candidate or candidate.startswith("#"):
+                        continue
+                    if candidate.startswith(
+                        ("http://", "socks5://", "socks5h://")
+                    ):
+                        pool.append(candidate)
+                if pool:
+                    break
+            except Exception:
+                continue
+        if not pool:
+            single = str(config.get("proxy", "") or "").strip()
+            if single:
+                pool = [single]
+        _proxy_pool = pool
+        return list(_proxy_pool)
 
 
 def set_thread_proxy(proxy: str):
+    """把当前注册 worker 的完整代理 URL 绑定到线程上下文。"""
     _proxy_tls.proxy = str(proxy or "").strip()
 
 
 def get_thread_proxy() -> str:
+    """返回当前注册 worker 已绑定的代理 URL。"""
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
 def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
-    """worker 绑定 pool[wid], pool[wid+workers], ... 轮换。"""
+    """为普通代理 worker 从其代理池分片中选择当前轮换项。"""
     pool = _proxy_pool or load_proxy_pool()
     if not pool:
         return str(config.get("proxy", "") or "").strip()
@@ -611,7 +787,83 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     return pool[idx]
 
 
+def bind_proxy_for_account(
+    batch_id: str,
+    worker_id: int,
+    account_index: int,
+    *,
+    rotate_idx: int = 0,
+    force_new_resin_lease: bool = False,
+) -> tuple[str, str]:
+    """为一个注册账号绑定代理，返回完整代理 URL 与 Resin Account。
+
+    Resin 模式用批次、worker 和账号序号形成稳定槽位；当前槽位发生浏览器或
+    邮箱重试时复用相同 Account。只有在尚未开始注册且明确要求跳过坏出口时，
+    ``force_new_resin_lease`` 才会增加代次并申请新租约。
+    """
+    if not is_resin_proxy_mode():
+        proxy = pick_proxy_for_worker(worker_id, rotate_idx)
+        set_thread_proxy(proxy)
+        _proxy_tls.resin_slot = ""
+        _proxy_tls.resin_generation = 0
+        _proxy_tls.resin_account = ""
+        return proxy, ""
+
+    validate_proxy_config()
+    slot = (
+        f"{str(batch_id)}|{max(int(worker_id), 0)}|"
+        f"{max(int(account_index), 0)}"
+    )
+    previous_slot = str(getattr(_proxy_tls, "resin_slot", "") or "")
+    if previous_slot != slot:
+        generation = 0
+    else:
+        generation = int(getattr(_proxy_tls, "resin_generation", 0) or 0)
+        if force_new_resin_lease:
+            generation += 1
+    account = resin_account_id(batch_id, worker_id, account_index, generation)
+    proxy = build_resin_proxy_url(
+        str(config.get("proxy", "") or ""),
+        str(config.get("resin_token", "") or ""),
+        str(config.get("resin_platform", RESIN_DEFAULT_PLATFORM) or ""),
+        account,
+    )
+    _proxy_tls.resin_slot = slot
+    _proxy_tls.resin_generation = generation
+    _proxy_tls.resin_account = account
+    set_thread_proxy(proxy)
+    return proxy, account
+
+
+def get_thread_resin_account() -> str:
+    """返回当前 worker 的 Resin Account，普通代理模式返回空字符串。"""
+    return str(getattr(_proxy_tls, "resin_account", "") or "")
+
+
+def connectivity_config_for_proxy(
+    source_config: dict | None = None,
+    account: str = "",
+) -> dict:
+    """构造连通性检查专用配置，并在 Resin 模式下注入可认证的粘性代理 URL。"""
+    source = config if source_config is None else source_config
+    result = dict(source)
+    if not is_resin_proxy_mode(source):
+        return result
+    validate_proxy_config(source)
+    check_account = str(account or "").strip()
+    if not check_account:
+        check_account = resin_account_id(new_resin_batch_id(), 0, 0)
+    result["proxy"] = build_resin_proxy_url(
+        str(source.get("proxy", "") or ""),
+        str(source.get("resin_token", "") or ""),
+        str(source.get("resin_platform", RESIN_DEFAULT_PLATFORM) or ""),
+        check_account,
+    )
+    return result
+
+
 def get_proxies():
+    """返回当前 worker 的 HTTP/HTTPS 代理映射，供浏览器外请求统一复用。"""
     proxy = get_thread_proxy() or str(config.get("proxy", "") or "").strip()
     if proxy:
         return {"http": proxy, "https": proxy}
@@ -920,7 +1172,16 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             "device_browser": "浏览器 Device Flow",
             "auth_code": "Authorization Code",
         }
-        _cpa_log(f"SSO → {_mode_labels.get(token_mode, token_mode)} 换 token (proxy={proxy}) ...")
+        proxy_label = redact_proxy(proxy) or "直连"
+        resin_label = (
+            f", Resin Account={get_thread_resin_account()}"
+            if get_thread_resin_account()
+            else ""
+        )
+        _cpa_log(
+            f"SSO → {_mode_labels.get(token_mode, token_mode)} "
+            f"换 token (proxy={proxy_label}{resin_label}) ..."
+        )
 
         def _browser_approve(user_code, open_url):
             return authorize_device_in_browser(
@@ -2278,6 +2539,80 @@ class GrokRegisterGUI:
         self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
         add_field(self.proxy_entry, 1, 3)
 
+        add_label(2, 0, "代理类型:")
+        # proxy_mode_var 保存 GUI 展示值，写入配置时转换为 normal/resin。
+        self.proxy_mode_var = tk.StringVar(
+            value=(
+                "Resin 粘性代理"
+                if is_resin_proxy_mode(config)
+                else "普通代理"
+            )
+        )
+        # proxy_mode_combo 允许在原有普通代理和 Resin 粘性代理之间切换。
+        self.proxy_mode_combo = tk_option_menu(
+            config_frame,
+            self.proxy_mode_var,
+            ["普通代理", "Resin 粘性代理"],
+            width=16,
+        )
+        add_field(self.proxy_mode_combo, 2, 1, sticky=tk.W)
+
+        # resin_frame 仅在选择 Resin 模式时显示 Token 和 Platform 输入框。
+        self.resin_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        self.resin_frame.grid(
+            row=2,
+            column=2,
+            columnspan=2,
+            sticky=tk.EW,
+            padx=(0, 14),
+            pady=3,
+        )
+        self.resin_frame.grid_columnconfigure(1, weight=1)
+        self.resin_frame.grid_columnconfigure(3, weight=1)
+        # resin_token_var 保存 Resin 正向代理密码，输入控件始终以掩码显示。
+        self.resin_token_var = tk.StringVar(
+            value=str(config.get("resin_token", "") or "")
+        )
+        # resin_platform_var 保存 Resin 节点隔离平台，默认使用全部节点平台。
+        self.resin_platform_var = tk.StringVar(
+            value=str(
+                config.get("resin_platform", RESIN_DEFAULT_PLATFORM)
+                or RESIN_DEFAULT_PLATFORM
+            )
+        )
+        tk_label(self.resin_frame, text="Resin Token:", bg=UI_PANEL_BG).grid(
+            row=0,
+            column=0,
+            sticky=tk.W,
+            padx=(0, 6),
+        )
+        # resin_token_entry 以密码掩码接收 Token，防止 GUI 截图直接暴露凭据。
+        self.resin_token_entry = tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_token_var,
+            width=24,
+            show="*",
+        )
+        self.resin_token_entry.grid(
+            row=0,
+            column=1,
+            sticky=tk.EW,
+            padx=(0, 14),
+        )
+        tk_label(self.resin_frame, text="Platform:", bg=UI_PANEL_BG).grid(
+            row=0,
+            column=2,
+            sticky=tk.W,
+            padx=(0, 6),
+        )
+        # resin_platform_entry 允许选择 Default 或 Resin 中已创建的自定义平台。
+        self.resin_platform_entry = tk_entry(
+            self.resin_frame,
+            textvariable=self.resin_platform_var,
+            width=18,
+        )
+        self.resin_platform_entry.grid(row=0, column=3, sticky=tk.EW)
+
         # 服务商专属配置（按选择显示）
         self.provider_frame = tk.LabelFrame(
             config_frame,
@@ -2289,7 +2624,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.provider_frame.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
+        self.provider_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
         self.provider_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.provider_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -2559,7 +2894,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
         }
 
-        add_label(3, 0, "并发数（可选）:")
+        add_label(4, 0, "并发数（可选）:")
         self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
         self.workers_spinbox = tk.Spinbox(
             config_frame,
@@ -2575,15 +2910,15 @@ class GrokRegisterGUI:
             disabledforeground=UI_MUTED_FG,
             relief=tk.SOLID,
         )
-        add_field(self.workers_spinbox, 3, 1, sticky=tk.W)
+        add_field(self.workers_spinbox, 4, 1, sticky=tk.W)
 
-        add_label(3, 2, "账号间隔（秒）:")
+        add_label(4, 2, "账号间隔（秒）:")
         self.account_interval_var = tk.StringVar(
             value=str(config.get("account_interval", "60-120") or "60-120")
         )
         add_field(
             tk_entry(config_frame, textvariable=self.account_interval_var, width=20),
-            3,
+            4,
             3,
         )
 
@@ -2598,7 +2933,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.cpa_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -2653,8 +2988,10 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 4, 1, columnspan=3)
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
+        self.proxy_mode_var.trace_add("write", lambda *_: self._refresh_proxy_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self._refresh_provider_fields()
+        self._refresh_proxy_fields()
         self._refresh_cpa_fields()
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
@@ -2722,6 +3059,7 @@ class GrokRegisterGUI:
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         self.log("[*] GUI 已就绪，配置已加载")
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
+        self.log(f"[*] 当前代理类型: {self.proxy_mode_var.get()}")
 
     def _refresh_provider_fields(self):
         """按当前邮箱服务商只显示相关配置项。"""
@@ -2765,6 +3103,26 @@ class GrokRegisterGUI:
             self.icloud_remote_port_var.get().strip() or "8090"
         )
 
+    def _refresh_proxy_fields(self):
+        """根据代理类型显示或隐藏 Resin Token 与 Platform 输入区域。"""
+        resin_enabled = "resin" in self.proxy_mode_var.get().strip().lower()
+        if resin_enabled:
+            self.resin_frame.grid()
+        else:
+            self.resin_frame.grid_remove()
+
+    def _apply_proxy_ui_config(self):
+        """把 GUI 代理类型、统一入口、Resin Token 和 Platform 写回配置。"""
+        mode_text = self.proxy_mode_var.get().strip().lower()
+        config["proxy_mode"] = (
+            PROXY_MODE_RESIN if "resin" in mode_text else PROXY_MODE_NORMAL
+        )
+        config["proxy"] = self.proxy_var.get().strip()
+        config["resin_token"] = self.resin_token_var.get()
+        config["resin_platform"] = (
+            self.resin_platform_var.get().strip() or RESIN_DEFAULT_PLATFORM
+        )
+
     def _refresh_cpa_fields(self):
         """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
         enabled = bool(self.cpa_auto_add_var.get())
@@ -2775,6 +3133,8 @@ class GrokRegisterGUI:
                 widget.grid_remove()
 
     def log(self, message):
+        """把脱敏后的消息同时写入控制台、会话日志和 GUI 日志框。"""
+        message = redact_sensitive_text(message)
         if not should_emit_log(message):
             return
         if self._queue_ui_call(self.log, message):
@@ -2828,7 +3188,7 @@ class GrokRegisterGUI:
         # 先把当前 GUI 关键字段写回内存配置（不强制保存文件）
         try:
             config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
-            config["proxy"] = self.proxy_var.get().strip()
+            self._apply_proxy_ui_config()
             config["duckmail_api_key"] = self.api_key_var.get().strip()
             config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip()
             config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
@@ -2857,6 +3217,8 @@ class GrokRegisterGUI:
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+            validate_proxy_config()
+            check_config = connectivity_config_for_proxy()
         except Exception as exc:
             self.log(f"[!] 当前配置无法用于连通性检查: {exc}")
             return
@@ -2864,8 +3226,13 @@ class GrokRegisterGUI:
         self.check_btn.config(state=tk.DISABLED)
 
         def _job():
+            """在后台线程执行连通性检查，避免阻塞 Tk 主事件循环。"""
             try:
-                results = _conn.run_connectivity_checks(config, http_get, http_post)
+                results = _conn.run_connectivity_checks(
+                    check_config,
+                    http_get,
+                    http_post,
+                )
                 text = _conn.format_check_results(results)
                 all_ok = all(ok for _, ok, _ in results)
                 self.ui_queue.put((self._on_check_done, (text, all_ok)))
@@ -2928,7 +3295,7 @@ class GrokRegisterGUI:
         config["debug_mode"] = bool(self.debug_mode_var.get())
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
         config["log_level"] = (self.log_level_var.get().strip() or "info").lower()
-        config["proxy"] = self.proxy_var.get().strip()
+        self._apply_proxy_ui_config()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip() or DUCKMAIL_API_BASE_DEFAULT
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
@@ -2972,6 +3339,11 @@ class GrokRegisterGUI:
             config["cloudflare_path_token"] = raw_paths[2] if raw_paths[2].startswith("/") else ("/" + raw_paths[2])
             config["cloudflare_path_messages"] = raw_paths[3] if raw_paths[3].startswith("/") else ("/" + raw_paths[3])
         config["account_interval"] = self.account_interval_var.get().strip() or "0"
+        try:
+            validate_proxy_config()
+        except ValueError as proxy_exc:
+            self.log(f"[!] 代理配置无效: {proxy_exc}")
+            return
         save_config()
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
@@ -3024,6 +3396,9 @@ class GrokRegisterGUI:
         config["register_count"] = count
         config["register_workers"] = workers
         save_config()
+        # _proxy_batch_id 保证本轮每个账号的 Resin Account 唯一且可重复计算。
+        self._proxy_batch_id = new_resin_batch_id()
+        load_proxy_pool()
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
@@ -3039,7 +3414,13 @@ class GrokRegisterGUI:
         self._accounts_lock = threading.Lock()
         # 启动前快速连通性检查（失败仍可继续，只警告）
         try:
-            checks = _conn.run_connectivity_checks(config, http_get, http_post)
+            first_account = resin_account_id(self._proxy_batch_id, 0, 0)
+            check_config = connectivity_config_for_proxy(config, first_account)
+            checks = _conn.run_connectivity_checks(
+                check_config,
+                http_get,
+                http_post,
+            )
             for name, ok, detail in checks:
                 self.log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
             if _conn.has_blocking_xai_failure(checks):
@@ -3056,6 +3437,12 @@ class GrokRegisterGUI:
             f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}{_interval_info}"
             + (" | 调试模式" if config.get("debug_mode") else "")
         )
+        if is_resin_proxy_mode():
+            self.log(
+                "[*] Resin 粘性代理: "
+                f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)}，"
+                "每个账号使用独立 Account"
+            )
         if int(self.workers_var.get() or 1) > count and not config.get("debug_mode"):
             self.log(f"[*] 并发已自动调整为 {workers}（不超过注册数量）")
         _mode_map = {"device_protocol": "协议 Device Flow", "device_browser": "浏览器 Device Flow", "auth_code": "Authorization Code"}
@@ -3075,6 +3462,7 @@ class GrokRegisterGUI:
         self.log("[!] 用户停止注册" + ("（将保留浏览器）" if keep else "（将关闭浏览器）"))
 
     def _run_registration_entry(self, count, workers):
+        """协调 GUI 注册 worker，并在全部分片结束后统一恢复界面状态。"""
         # 并发数不超过任务数，避免空 worker 白开浏览器
         workers = max(1, min(int(workers or 1), 24, int(count or 1)))
         # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -3115,6 +3503,9 @@ class GrokRegisterGUI:
     def run_registration(self, count, worker_id=0, workers=1):
         """在指定 GUI worker 中执行注册，并在结束时保留已创建的 iCloud 别名。"""
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
+        batch_id = str(
+            getattr(self, "_proxy_batch_id", "") or new_resin_batch_id()
+        )
 
         def wlog(message):
             text = str(message)
@@ -3124,6 +3515,21 @@ class GrokRegisterGUI:
                 self.log(text)
 
         try:
+            i = 0
+            bound_proxy, resin_account = bind_proxy_for_account(
+                batch_id,
+                worker_id,
+                i,
+            )
+            logged_proxy_index = i
+            if resin_account:
+                wlog(
+                    "[*] Resin 账号代理已绑定: "
+                    f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                    f"Account={resin_account} 入口={redact_proxy(bound_proxy)}"
+                )
+            else:
+                wlog(f"[*] 账号代理已绑定: {redact_proxy(bound_proxy) or '直连'}")
             try:
                 start_browser(log_callback=wlog)
             except Exception as boot_exc:
@@ -3136,12 +3542,28 @@ class GrokRegisterGUI:
                 self.update_stats()
                 return
             wlog("[*] 浏览器已启动")
-            i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
             while i < count:
                 if self.should_stop():
                     break
+                bound_proxy, resin_account = bind_proxy_for_account(
+                    batch_id,
+                    worker_id,
+                    i,
+                )
+                if logged_proxy_index != i:
+                    logged_proxy_index = i
+                    if resin_account:
+                        wlog(
+                            "[*] 下一个账号使用新的 Resin 租约: "
+                            f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                            f"Account={resin_account} 入口={redact_proxy(bound_proxy)}"
+                        )
+                    else:
+                        wlog(
+                            f"[*] 下一个账号代理: {redact_proxy(bound_proxy) or '直连'}"
+                        )
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 try:
                     email = ""
@@ -3328,6 +3750,8 @@ class CliStopController:
 
 
 def cli_log(message):
+    """把脱敏后的 CLI 消息写入控制台和本次会话日志。"""
+    message = redact_sensitive_text(message)
     if not should_emit_log(message):
         return
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -3339,6 +3763,12 @@ def cli_log(message):
 def run_registration_cli(count):
     """执行 CLI 单线程或多线程注册，并在每次尝试后保留 iCloud 别名。"""
     controller = CliStopController()
+    try:
+        validate_proxy_config()
+    except ValueError as proxy_exc:
+        cli_log(f"[!] 代理配置无效: {proxy_exc}")
+        return
+    proxy_batch_id = new_resin_batch_id()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
     # curl_cffi C 回调里向上传播（那里 KeyboardInterrupt 会被吞掉，导致
@@ -3364,6 +3794,12 @@ def run_registration_cli(count):
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 24, int(count or 1)))
     pool = load_proxy_pool()
     cli_log(f"[*] 终端模式启动，目标数量: {count} | 并发: {workers} | 代理池: {len(pool)}")
+    if is_resin_proxy_mode():
+        cli_log(
+            "[*] Resin 粘性代理: "
+            f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)}，"
+            "每个账号使用独立 Account"
+        )
     _cli_interval_raw = str(config.get("account_interval", "0") or "0").strip()
     if _cli_interval_raw and _cli_interval_raw != "0":
         cli_log(f"[*] 账号间注册间隔: {_cli_interval_raw}s")
@@ -3376,7 +3812,13 @@ def run_registration_cli(count):
     except Exception:
         pass
     try:
-        startup_checks = _conn.run_connectivity_checks(config, http_get, http_post)
+        first_account = resin_account_id(proxy_batch_id, 0, 0)
+        check_config = connectivity_config_for_proxy(config, first_account)
+        startup_checks = _conn.run_connectivity_checks(
+            check_config,
+            http_get,
+            http_post,
+        )
         for name, ok, detail in startup_checks:
             cli_log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
         if _conn.has_blocking_xai_failure(startup_checks):
@@ -3411,10 +3853,24 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             rotate_idx = 0
+            i = 0
             try:
-                px = pick_proxy_for_worker(wid, rotate_idx)
-                set_thread_proxy(px)
-                cli_log(f"[W{wid+1}] [*] 绑定代理: {px}")
+                px, resin_account = bind_proxy_for_account(
+                    proxy_batch_id,
+                    wid,
+                    i,
+                    rotate_idx=rotate_idx,
+                )
+                if resin_account:
+                    cli_log(
+                        f"[W{wid+1}] [*] Resin 账号代理已绑定: "
+                        f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                        f"Account={resin_account} 入口={redact_proxy(px)}"
+                    )
+                else:
+                    cli_log(
+                        f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px) or '直连'}"
+                    )
                 try:
                     start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
@@ -3432,9 +3888,22 @@ def run_registration_cli(count):
                             break
                         rotate_idx += 1
                         try:
-                            px = pick_proxy_for_worker(wid, rotate_idx)
-                            set_thread_proxy(px)
-                            cli_log(f"[W{wid+1}] [*] 跳过坏出口，换代理 #{rotate_idx}: {px} ({msgb[:80]})")
+                            px, resin_account = bind_proxy_for_account(
+                                proxy_batch_id,
+                                wid,
+                                i,
+                                rotate_idx=rotate_idx,
+                                force_new_resin_lease=is_resin_proxy_mode(),
+                            )
+                            binding_detail = (
+                                f"Resin Account={resin_account}"
+                                if resin_account
+                                else redact_proxy(px)
+                            )
+                            cli_log(
+                                f"[W{wid+1}] [*] 跳过坏出口，换代理 "
+                                f"#{rotate_idx}: {binding_detail} ({msgb[:80]})"
+                            )
                             start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                             booted = True
                             break
@@ -3453,10 +3922,17 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         return
-                i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
                     try:
+                        # 同一 i 对应同一个 Resin 槽位，流程重试不会改变粘性身份。
+                        bind_proxy_for_account(
+                            proxy_batch_id,
+                            wid,
+                            i,
+                            rotate_idx=rotate_idx,
+                        )
+                        email = ""
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
@@ -3525,8 +4001,8 @@ def run_registration_cli(count):
                             bot_flag=0,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
-                        # 每成功 2 个换 sticky，降低同 IP 密度（对齐 ~4 分钟窗口）
-                        if local_success % 2 == 0:
+                        # Resin 每个账号天然使用新 Account；普通代理保留原两号轮换策略。
+                        if not is_resin_proxy_mode() and local_success % 2 == 0:
                             rotate_idx += 1
                     except RegistrationCancelled:
                         break
@@ -3623,7 +4099,16 @@ def run_registration_cli(count):
                             )
                         if kind == FAIL_RISK:
                             rotate_idx += 1
-                            cli_log(f"[W{wid+1}] [*] 风控拒绝，切换 sticky #{rotate_idx}")
+                            if is_resin_proxy_mode():
+                                cli_log(
+                                    f"[W{wid+1}] [*] 风控拒绝，"
+                                    "下一个账号将使用新的 Resin Account"
+                                )
+                            else:
+                                cli_log(
+                                    f"[W{wid+1}] [*] 风控拒绝，"
+                                    f"切换 sticky #{rotate_idx}"
+                                )
                         elif blank_ui or proxy_dead or turnstile_stuck or profile_soft or kind in (
                             FAIL_TURNSTILE,
                             FAIL_PROFILE,
@@ -3648,9 +4133,22 @@ def run_registration_cli(count):
                             except Exception:
                                 pass
                             try:
-                                px = pick_proxy_for_worker(wid, rotate_idx)
-                                set_thread_proxy(px)
-                                cli_log(f"[W{wid+1}] [*] 下号代理: {px}")
+                                px, resin_account = bind_proxy_for_account(
+                                    proxy_batch_id,
+                                    wid,
+                                    i,
+                                    rotate_idx=rotate_idx,
+                                )
+                                if resin_account:
+                                    cli_log(
+                                        f"[W{wid+1}] [*] 下号 Resin Account: "
+                                        f"{resin_account} 入口={redact_proxy(px)}"
+                                    )
+                                else:
+                                    cli_log(
+                                        f"[W{wid+1}] [*] 下号代理: "
+                                        f"{redact_proxy(px) or '直连'}"
+                                    )
                                 start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                                 time.sleep(0.5)
                             except Exception as boot_exc:
@@ -3665,9 +4163,23 @@ def run_registration_cli(count):
                                         break
                                     rotate_idx += 1
                                     try:
-                                        px = pick_proxy_for_worker(wid, rotate_idx)
-                                        set_thread_proxy(px)
-                                        cli_log(f"[W{wid+1}] [*] 下号跳过黑名单，换 #{rotate_idx}: {px}")
+                                        # 账号流程可能正在重试，此处只让 Resin 自身故障转移，
+                                        # 不强制更换 Account，避免中途改变账号出口身份。
+                                        px, resin_account = bind_proxy_for_account(
+                                            proxy_batch_id,
+                                            wid,
+                                            i,
+                                            rotate_idx=rotate_idx,
+                                        )
+                                        binding_detail = (
+                                            f"Resin Account={resin_account}"
+                                            if resin_account
+                                            else redact_proxy(px)
+                                        )
+                                        cli_log(
+                                            f"[W{wid+1}] [*] 下号重试代理 "
+                                            f"#{rotate_idx}: {binding_detail}"
+                                        )
                                         start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                                         time.sleep(0.5)
                                         last_boot = None
@@ -3712,6 +4224,21 @@ def run_registration_cli(count):
         return
 
     try:
+        i = 0
+        px, resin_account = bind_proxy_for_account(
+            proxy_batch_id,
+            0,
+            i,
+        )
+        logged_proxy_index = i
+        if resin_account:
+            cli_log(
+                "[*] Resin 账号代理已绑定: "
+                f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                f"Account={resin_account} 入口={redact_proxy(px)}"
+            )
+        else:
+            cli_log(f"[*] 账号代理已绑定: {redact_proxy(px) or '直连'}")
         try:
             start_browser(log_callback=cli_log)
         except Exception as boot_exc:
@@ -3720,10 +4247,26 @@ def run_registration_cli(count):
             cli_log(f"[-] 浏览器启动失败，{count} 个任务均记为失败: {boot_exc}")
             return
         cli_log("[*] 浏览器已启动")
-        i = 0
         while i < count:
             if controller.should_stop():
                 break
+            px, resin_account = bind_proxy_for_account(
+                proxy_batch_id,
+                0,
+                i,
+            )
+            if logged_proxy_index != i:
+                logged_proxy_index = i
+                if resin_account:
+                    cli_log(
+                        "[*] 下一个账号使用新的 Resin 租约: "
+                        f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                        f"Account={resin_account} 入口={redact_proxy(px)}"
+                    )
+                else:
+                    cli_log(
+                        f"[*] 下一个账号代理: {redact_proxy(px) or '直连'}"
+                    )
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
                 email = ""

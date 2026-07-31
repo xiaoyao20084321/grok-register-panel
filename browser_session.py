@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from typing import Callable, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 import asyncio
 from greenlet import greenlet
@@ -146,6 +146,33 @@ def get_exit_ip() -> str:
 def get_bound_proxy() -> str:
     """当前线程绑定的代理 URL。"""
     return str(getattr(_tls, "bound_proxy", "") or "")
+
+
+def _redact_proxy_url(proxy_url: str) -> str:
+    """移除代理 URL 中的用户名和密码，避免 Resin Token 进入控制台日志。"""
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if parsed.username is None and parsed.password is None:
+            return raw
+        hostname = str(parsed.hostname or "")
+        host_text = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            host_text = f"{host_text}:{parsed.port}"
+        return urlunparse(
+            (
+                parsed.scheme,
+                host_text,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+    except Exception:
+        return "***"
 
 
 def set_exit_context(proxy: str = "", exit_ip: str = "") -> None:
@@ -480,7 +507,7 @@ def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 8.0, log_callback=No
 
 
 def _build_camoufox_proxy(proxy_str: str) -> dict:
-    """把 http://host:port 格式的代理 URL 转换为 Camoufox/Playwright proxy dict。"""
+    """把代理 URL 转成 Camoufox 配置，并还原 URL 编码后的 Resin 认证字段。"""
     proxy_str = proxy_str.strip()
     if not proxy_str:
         return {}
@@ -492,10 +519,10 @@ def _build_camoufox_proxy(proxy_str: str) -> dict:
     else:
         server = proxy_str
     result: dict = {"server": server}
-    if parsed.username:
-        result["username"] = parsed.username
-    if parsed.password:
-        result["password"] = parsed.password
+    if parsed.username is not None:
+        result["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        result["password"] = unquote(parsed.password)
     return result
 
 
@@ -714,7 +741,10 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 meta = str(getattr(_tls, "exit_meta", "") or "")
                 if eip or bpx:
                     extra = f" | {meta}" if meta else ""
-                    log_callback(f"[*] 出口IP={eip or '?'} 代理={bpx or '?'}{extra}")
+                    safe_proxy = _redact_proxy_url(bpx)
+                    log_callback(
+                        f"[*] 出口IP={eip or '?'} 代理={safe_proxy or '?'}{extra}"
+                    )
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser_obj, page_obj
