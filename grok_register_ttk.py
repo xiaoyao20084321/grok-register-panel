@@ -3405,32 +3405,76 @@ class GrokRegisterGUI:
         self.fail_stats = empty_fail_stats()
         self.results = []
         self.batch_count = count
-        self._batch_started_at = time.time()
+        self._batch_started_at = None
         self.progress_var.set(0)
         self.eta_var.set(f"进度 0/{count} | ETA --")
         self.update_stats()
         self._set_running_ui(True)
+        self.status_var.set("正在检查...")
+        self.status_label.config(foreground="blue")
         self._stats_lock = threading.Lock()
         self._accounts_lock = threading.Lock()
-        # 启动前快速连通性检查（失败仍可继续，只警告）
         try:
             first_account = resin_account_id(self._proxy_batch_id, 0, 0)
             check_config = connectivity_config_for_proxy(config, first_account)
+        except Exception as exc:
+            self.log(f"[!] 无法准备启动前连通性检查: {exc}")
+            self._set_running_ui(False)
+            return
+        self.log("[*] 正在执行启动前连通性检查...")
+        threading.Thread(
+            target=self._run_startup_connectivity_check,
+            args=(count, workers, check_config),
+            daemon=True,
+        ).start()
+
+    def _run_startup_connectivity_check(self, count, workers, check_config):
+        """在后台执行启动前检查，并把检查结果排入 Tk 主线程处理。"""
+        checks = []
+        error_text = ""
+        try:
             checks = _conn.run_connectivity_checks(
                 check_config,
                 http_get,
                 http_post,
             )
-            for name, ok, detail in checks:
-                self.log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
-            if _conn.has_blocking_xai_failure(checks):
-                self.log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
-                self._set_running_ui(False)
-                return
-            if not all(ok for _, ok, _ in checks):
-                self.log("[!] 连通性检查存在失败项，仍继续注册（可先点「连通性检查」排查）")
         except Exception as exc:
-            self.log(f"[!] 连通性检查异常: {exc}")
+            error_text = str(exc)
+        self.ui_queue.put(
+            (
+                self._on_startup_connectivity_done,
+                (count, workers, checks, error_text),
+            )
+        )
+
+    def _on_startup_connectivity_done(
+        self,
+        count,
+        workers,
+        checks,
+        error_text,
+    ):
+        """在 Tk 主线程展示启动检查结果，并按原有规则决定是否开始注册。"""
+        for name, ok, detail in checks:
+            self.log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
+        if error_text:
+            self.log(f"[!] 连通性检查异常: {error_text}")
+
+        # 用户可在后台检查期间点击停止；检查返回后不得再启动浏览器。
+        if self.stop_requested or not self.is_running:
+            self.log("[*] 启动已取消，未进入注册流程")
+            self._set_running_ui(False)
+            return
+        if _conn.has_blocking_xai_failure(checks):
+            self.log("[!] xAI 注册页被 Cloudflare 拦截，已停止建号；请更换当前 proxy 后重试")
+            self._set_running_ui(False)
+            return
+        if checks and not all(ok for _, ok, _ in checks):
+            self.log("[!] 连通性检查存在失败项，仍继续注册（可先点「连通性检查」排查）")
+
+        self._batch_started_at = time.time()
+        self.status_var.set("运行中...")
+        self.status_label.config(foreground="blue")
         _interval_raw = str(config.get("account_interval", "0") or "0").strip()
         _interval_info = f" | 账号间隔: {_interval_raw}s" if _interval_raw and _interval_raw != "0" else ""
         self.log(
