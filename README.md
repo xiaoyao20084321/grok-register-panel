@@ -24,7 +24,7 @@ Based on [AaronL725/grok-register](https://github.com/AaronL725/grok-register) (
 | 能力 | 说明 |
 |------|------|
 | 注册全链路 | 邮箱 OTP → 资料页 → Turnstile → SSO → Device / OAuth → 写入 CPA / Grok2API |
-| 多邮箱后端 | iCloud Hide My Email、Cloudflare Worker 邮、DuckMail、YYDS、MailNest、CloudMail 等 |
+| 多邮箱后端 | OutlookEmail 完整 API、iCloud Hide My Email、Cloudflare Worker 邮、DuckMail、YYDS、MailNest、CloudMail 等 |
 | 反检测浏览器 | [Camoufox](https://camoufox.com/)（Gecko 层指纹） |
 | 出口预检 | 启动前解析出口 IP / ASN，命中黑名单直接换口 |
 | 风控早停 | `botFlagSource=1` + `policy=deny` 时跳过后续 OAuth，避免无效重试 |
@@ -84,7 +84,12 @@ cp config.example.json config.json
 
 | 字段 | 说明 |
 |------|------|
-| `email_provider` | `icloud` / `cloudflare` / `duckmail` / `yyds` / `mailnest` / … |
+| `email_provider` | `outlook_email` / `icloud` / `cloudflare` / `duckmail` / `yyds` / `mailnest` / … |
+| `outlook_email_base_url` | OutlookEmail v3.0.2 服务地址，如 `https://mail.example.com` |
+| `outlook_email_login_password` | OutlookEmail Web 登录密码；完整 API 使用 Session，不需要对外 API Key |
+| `outlook_email_project_key` | 独立项目状态标识，默认 `grok-register`；不会影响同一批邮箱在其他项目中的状态 |
+| `outlook_email_group_ids` | 可选分组 ID 数组；留空表示把全部普通邮箱纳入项目，不需要专门新建分组 |
+| `outlook_email_use_alias_email` | 是否优先领取 OutlookEmail 账号别名；默认使用主邮箱 |
 | `icloud_api_base` | SSH 隧道在本机暴露的 icloud-hme API，默认 `http://127.0.0.1:18090` |
 | `icloud_enable_tunnel` | iCloud 模式下自动建立或复用 SSH 本地端口转发 |
 | `icloud_ssh_key` / `icloud_ssh_user` / `icloud_ssh_host` | SSH 私钥、用户和云服务器地址 |
@@ -113,6 +118,23 @@ cp config.example.json config.json
 Grok2API Web SSO 与 Grok2API Build OAuth；Web 与 Build 使用两个独立接口和
 独立重试链。OAuth 换取失败时，会在换取流程结束后单独交付已经取得的 Web SSO。
 未勾选的输出目标不会上传，也不会生成本地备用文件。
+
+### OutlookEmail 完整 API
+
+`email_provider=outlook_email` 时，只需填写部署地址和 Web 登录密码。注册机会先
+调用登录接口建立 Session，再自动获取 CSRF Token；因此不读取也不要求“对外
+API Key”。首次领取邮箱时会自动创建或补全 `grok-register` 项目，分组 ID
+留空即使用全部普通邮箱，不必额外新建分组。
+
+项目只保存这批邮箱在 Grok 注册用途下的独立状态。同一个邮箱仍可加入其他项目，
+也可继续用于其他业务。多 worker 会通过项目租约独占领取：注册成功标记为
+`done`，注册失败标记为 `failed`，用户主动停止则释放回 `toClaim`；异常退出后
+租约最长 3600 秒自动过期。程序会同时检查收件箱和垃圾邮件，并在领取时记录
+历史邮件基线，避免误用旧验证码。
+
+Web 登录密码只保存在被 `.gitignore` 忽略且保存时设为 `0600` 的 `config.json`
+和运行内存中；日志、`mail_credentials.txt` 及本地租约令牌都不会保存该密码或
+服务端 claim token。
 
 ### iCloud Hide My Email
 
@@ -302,6 +324,7 @@ python grok_register_ttk.py
 │   ├── security_utils.py      # redact / token 校验
 │   └── blacklist_ops.py       # 黑名单读写 / 重置（包相对路径）
 ├── email_providers/
+│   └── outlook_email.py       # OutlookEmail Session / 项目租约 / 验证码读取
 ├── tests/                     # 结构 / 脱敏 / chdir 冒烟
 ├── scripts/                   # xvfb 辅助脚本
 ├── config.example.json

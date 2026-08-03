@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import icloud_hme as icloud_hme_provider
+from email_providers import outlook_email as outlook_email_provider
 
 CheckResult = Tuple[str, bool, str]  # name, ok, detail
 XAI_SIGNUP_CHECK_NAME = "xAI注册页"
@@ -139,6 +140,25 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
     """检查当前邮箱 provider 的必填配置、网络可达性和关键认证状态。"""
     provider = (provider or "").strip().lower()
     try:
+        if provider == "outlook_email":
+            summary = outlook_email_provider.check_connectivity(config)
+            accounts = int(summary.get("accounts", 0) or 0)
+            active = int(summary.get("active", 0) or 0)
+            if accounts <= 0:
+                return "邮箱API", False, "OutlookEmail 登录成功，但没有普通邮箱"
+            if active <= 0:
+                return "邮箱API", False, "OutlookEmail 登录成功，但没有 active 普通邮箱"
+            project_note = (
+                f"现有项目可领取={int(summary.get('to_claim', 0) or 0)}"
+                if summary.get("project_exists")
+                else "项目将在首次领取时自动创建"
+            )
+            return (
+                "邮箱API",
+                True,
+                f"OutlookEmail 完整 API 可用，邮箱={accounts}，活跃={active}，{project_note}",
+            )
+
         if provider == "icloud":
             state_path = str(
                 Path(__file__).resolve().parent

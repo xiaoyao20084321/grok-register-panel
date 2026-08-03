@@ -738,8 +738,9 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
 
 
 def fill_email_and_submit(timeout=10, log_callback=None, cancel_callback=None):
+    """领取邮箱、写入注册页并提交，返回邮箱地址及后续收信令牌。"""
     raise_if_cancelled(cancel_callback)
-    email, dev_token = _deps['get_email_and_token']()
+    email, dev_token = _deps['get_email_and_token'](log_callback=log_callback)
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:

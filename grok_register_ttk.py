@@ -40,6 +40,7 @@ from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
 from email_providers import icloud_hme as icloud_hme_provider
 from email_providers import mailnest as mailnest_provider
+from email_providers import outlook_email as outlook_email_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
@@ -198,6 +199,22 @@ DEFAULT_CONFIG = {
     "icloud_request_timeout": 30,
     # SSH 隧道启动后等待 API 就绪的最长时间，单位为秒。
     "icloud_tunnel_timeout": 15,
+    # OutlookEmail 完整 API 地址可以是 HTTPS 反向代理或受保护的内网地址。
+    "outlook_email_base_url": "",
+    # Web 登录密码只写入被 Git 忽略的 config.json，并用于建立 Session。
+    "outlook_email_login_password": "",
+    # 项目标识保证所有 Grok worker 共享同一套邮箱领取状态。
+    "outlook_email_project_key": "grok-register",
+    # 项目名称仅用于 OutlookEmail 管理端展示。
+    "outlook_email_project_name": "Grok 注册",
+    # 分组 ID 留空表示使用全部普通邮箱；填写后只补入指定分组及其子分组。
+    "outlook_email_group_ids": [],
+    # 开启后项目优先领取账号别名，未配置别名的账号仍回退主邮箱。
+    "outlook_email_use_alias_email": False,
+    # 完整 API 请求超时需要覆盖远端 Graph/IMAP 读取。
+    "outlook_email_request_timeout": 30,
+    # 项目租约使用服务端允许的最大一小时，覆盖完整注册流程。
+    "outlook_email_lease_seconds": 3600,
     "duckmail_api_key": "",
     "duckmail_api_base": "https://api.duckmail.sbs",
     "defaultDomains": "",
@@ -313,6 +330,8 @@ FAIL_TURNSTILE = "turnstile"
 FAIL_PROFILE = "profile_fill"
 # FAIL_ICLOUD_LIMIT 单独统计 Apple 隐藏邮箱创建额度，避免归入模糊的“其它”。
 FAIL_ICLOUD_LIMIT = "icloud_hme_limit"
+# FAIL_OUTLOOK_POOL 单独统计项目邮箱耗尽，便于整批自动停止。
+FAIL_OUTLOOK_POOL = "outlook_email_pool_empty"
 FAIL_OTHER = "other"
 
 
@@ -340,12 +359,13 @@ def redact_proxy(url: str) -> str:
 
 
 def redact_sensitive_text(message) -> str:
-    """遮蔽日志中的代理、CPA 和 Grok2API 密钥，兼容 URL 编码形态。"""
+    """遮蔽日志中的代理、邮箱和输出服务密钥，兼容 URL 编码形态。"""
     text = str(message)
     secrets_to_mask = (
         str(config.get("resin_token", "") or ""),
         str(config.get("cpa_management_key", "") or ""),
         str(config.get("grok2api_admin_password", "") or ""),
+        str(config.get("outlook_email_login_password", "") or ""),
     )
     for secret in secrets_to_mask:
         for secret_value in (secret, quote(secret, safe="")):
@@ -364,6 +384,7 @@ def mask_email(email: str) -> str:
     return local[:2] + "***@" + domain
 
 
+# FAIL_LABELS 把内部失败分类转换为 GUI、CLI 共用的中文统计标签。
 FAIL_LABELS = {
     FAIL_DOMAIN: "域名拒绝",
     FAIL_RISK: "注册风控",
@@ -375,6 +396,7 @@ FAIL_LABELS = {
     FAIL_TURNSTILE: "资料页Turnstile",
     FAIL_PROFILE: "资料填写",
     FAIL_ICLOUD_LIMIT: "iCloud额度",
+    FAIL_OUTLOOK_POOL: "Outlook邮箱池耗尽",
     FAIL_OTHER: "其它",
 }
 
@@ -464,8 +486,11 @@ def record_register_result(
 
 
 def classify_failure(exc) -> str:
+    """把注册异常归入稳定分类，供统计、日志和批次终止策略使用。"""
     if isinstance(exc, icloud_hme_provider.ICloudHMEAddressLimitError):
         return FAIL_ICLOUD_LIMIT
+    if isinstance(exc, outlook_email_provider.OutlookEmailPoolEmptyError):
+        return FAIL_OUTLOOK_POOL
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
     if isinstance(exc, RegistrationRiskDenied):
@@ -591,9 +616,13 @@ def parse_account_interval() -> float:
 
 
 def save_config():
+    """保存包含认证信息的本地配置，并在类 Unix 系统限制为仅当前用户可读写。"""
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
+        # Web 登录密码和各输出密钥都在此文件中，类 Unix 保存后立即收紧权限。
+        if os.name != "nt":
+            os.chmod(CONFIG_FILE, 0o600)
     except Exception as e:
         print(f"保存配置失败: {e}")
 
@@ -2443,6 +2472,35 @@ def icloud_hme_get_oai_code(
     )
 
 
+def outlook_email_get_email_and_token(log_callback=None):
+    """从 OutlookEmail 的 Grok 项目领取邮箱并返回本地非敏感租约令牌。"""
+    return outlook_email_provider.create_mailbox(config, log_callback=log_callback)
+
+
+def outlook_email_get_oai_code(
+    lease_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    """通过 OutlookEmail 完整 API 轮询领取邮箱的 xAI 验证码。"""
+    return outlook_email_provider.wait_for_code(
+        config,
+        lease_token,
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
+
+
 def retain_email_provider_alias(log_callback=None):
     """结束当前 worker 的邮箱占用并永久保留 iCloud 别名及其本地记录。"""
     if get_email_provider() != "icloud":
@@ -2454,16 +2512,39 @@ def retain_email_provider_alias(log_callback=None):
     )
 
 
+def finalize_email_provider_claim(
+    outcome="release",
+    detail="",
+    log_callback=None,
+    stopped=False,
+):
+    """按注册结果结算项目邮箱；批次停止时释放尚未完成的领取。"""
+    provider = get_email_provider()
+    if provider == "outlook_email":
+        if stopped and str(outcome or "").strip().lower() == "failed":
+            outcome = "release"
+            detail = "批次停止，释放尚未完成的邮箱领取"
+        return outlook_email_provider.finalize_current_claim(
+            config,
+            outcome,
+            detail=detail,
+            log_callback=log_callback,
+        )
+    return retain_email_provider_alias(log_callback=log_callback)
+
+
 def get_email_provider():
     """返回规范化后的邮箱提供商名称。"""
     return str(config.get("email_provider", "cloudflare") or "cloudflare").strip().lower()
 
 
-def get_email_and_token(api_key=None):
+def get_email_and_token(api_key=None, log_callback=None):
     """按当前 provider 创建邮箱并返回邮箱地址和后续收信令牌。"""
     provider = get_email_provider()
+    if provider == "outlook_email":
+        return outlook_email_get_email_and_token(log_callback=log_callback)
     if provider == "icloud":
-        return icloud_hme_get_email_and_token()
+        return icloud_hme_get_email_and_token(log_callback=log_callback)
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
@@ -2512,6 +2593,16 @@ def get_oai_code(
 ):
     """按当前 provider 轮询注册验证码。"""
     provider = get_email_provider()
+    if provider == "outlook_email":
+        return outlook_email_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "icloud":
         return icloud_hme_get_oai_code(
             dev_token,
@@ -3406,7 +3497,15 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["icloud", "duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
+            [
+                "outlook_email",
+                "icloud",
+                "duckmail",
+                "yyds",
+                "cloudflare",
+                "mailnest",
+                "cloudmail",
+            ],
             width=12,
         )
         add_field(self.email_provider_combo, 1, 1, sticky=tk.W)
@@ -3905,6 +4004,105 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # OutlookEmail 完整 API
+        # outlook_email_base_url_var 保存部署站点地址，不复用注册代理。
+        self.outlook_email_base_url_var = tk.StringVar(
+            value=str(config.get("outlook_email_base_url", "") or "")
+        )
+        # outlook_email_login_password_var 保存 Web 登录密码并始终以掩码显示。
+        self.outlook_email_login_password_var = tk.StringVar(
+            value=str(config.get("outlook_email_login_password", "") or "")
+        )
+        # outlook_email_project_key_var 保存跨 worker 共用的项目唯一标识。
+        self.outlook_email_project_key_var = tk.StringVar(
+            value=str(
+                config.get("outlook_email_project_key", "grok-register")
+                or "grok-register"
+            )
+        )
+        outlook_group_ids = config.get("outlook_email_group_ids", []) or []
+        outlook_group_ids_text = (
+            str(outlook_group_ids)
+            if isinstance(outlook_group_ids, str)
+            else ",".join(str(item) for item in outlook_group_ids)
+        )
+        # outlook_email_group_ids_var 接收可选的逗号分隔分组 ID，留空表示全部普通邮箱。
+        self.outlook_email_group_ids_var = tk.StringVar(
+            value=outlook_group_ids_text
+        )
+        # outlook_email_use_alias_email_var 控制项目是否优先领取账号别名。
+        self.outlook_email_use_alias_email_var = tk.BooleanVar(
+            value=bool(config.get("outlook_email_use_alias_email", False))
+        )
+        # OutlookEmail 专属控件集合用于 provider 切换时整体显示或隐藏。
+        self._outlook_email_widgets = [
+            p_label(0, 0, "服务地址:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_email_base_url_var,
+                    width=52,
+                ),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "Web 登录密码:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_email_login_password_var,
+                    width=34,
+                    show="*",
+                ),
+                1,
+                1,
+            ),
+            p_label(1, 2, "项目标识:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_email_project_key_var,
+                    width=34,
+                ),
+                1,
+                3,
+            ),
+            p_label(2, 0, "分组 ID（可选）:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.outlook_email_group_ids_var,
+                    width=34,
+                ),
+                2,
+                1,
+            ),
+            p_label(2, 2, "领取方式:"),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="优先使用账号别名",
+                    variable=self.outlook_email_use_alias_email_var,
+                ),
+                2,
+                3,
+                sticky=tk.W,
+            ),
+            p_label(3, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="留空分组 ID 即使用全部普通邮箱；无需配置对外 API Key",
+                    bg=UI_PANEL_BG,
+                ),
+                3,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
         # iCloud HME
         # 本地 API 地址始终指向 SSH 隧道监听端口。
         self.icloud_api_base_var = tk.StringVar(
@@ -4024,6 +4222,7 @@ class GrokRegisterGUI:
 
         # provider 控件映射保证界面只显示当前邮箱后端的配置字段。
         self._provider_widget_groups = {
+            "outlook_email": self._outlook_email_widgets,
             "icloud": self._icloud_widgets,
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
@@ -4260,6 +4459,7 @@ class GrokRegisterGUI:
         """按当前邮箱服务商只显示相关配置项。"""
         provider = (self.email_provider_var.get() or "cloudflare").strip().lower()
         titles = {
+            "outlook_email": "OutlookEmail 完整 API 配置",
             "icloud": "iCloud Hide My Email 配置",
             "duckmail": "DuckMail / Mail.tm 配置",
             "cloudflare": "Cloudflare 配置",
@@ -4296,6 +4496,34 @@ class GrokRegisterGUI:
         )
         config["icloud_remote_port"] = int(
             self.icloud_remote_port_var.get().strip() or "8090"
+        )
+
+    def _apply_outlook_email_ui_config(self):
+        """把 GUI 中的完整 API 登录、项目和可选分组范围写回配置。"""
+        raw_group_ids = self.outlook_email_group_ids_var.get().strip()
+        group_ids = []
+        for item in raw_group_ids.split(",") if raw_group_ids else []:
+            text = item.strip()
+            if not text:
+                continue
+            group_id = int(text)
+            if group_id <= 0:
+                raise ValueError("OutlookEmail 分组 ID 必须为正整数")
+            if group_id not in group_ids:
+                group_ids.append(group_id)
+        config["outlook_email_base_url"] = (
+            self.outlook_email_base_url_var.get().strip().rstrip("/")
+        )
+        config["outlook_email_login_password"] = (
+            self.outlook_email_login_password_var.get()
+        )
+        config["outlook_email_project_key"] = (
+            self.outlook_email_project_key_var.get().strip().lower()
+            or "grok-register"
+        )
+        config["outlook_email_group_ids"] = group_ids
+        config["outlook_email_use_alias_email"] = bool(
+            self.outlook_email_use_alias_email_var.get()
         )
 
     def _refresh_proxy_fields(self):
@@ -4450,6 +4678,7 @@ class GrokRegisterGUI:
             config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
             config["cloudmail_password"] = self.cloudmail_password_var.get()
             self._apply_icloud_ui_config()
+            self._apply_outlook_email_ui_config()
             self._apply_auth_output_ui_config()
             validate_proxy_config()
             tunnel_config = dict(config)
@@ -4554,8 +4783,9 @@ class GrokRegisterGUI:
         config["cloudmail_password"] = self.cloudmail_password_var.get()
         try:
             self._apply_icloud_ui_config()
+            self._apply_outlook_email_ui_config()
         except ValueError:
-            self.log("[!] iCloud HME 本地端口或远端端口必须是整数")
+            self.log("[!] iCloud 端口或 OutlookEmail 分组 ID 配置无效")
             return
         self._apply_auth_output_ui_config()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
@@ -4598,6 +4828,15 @@ class GrokRegisterGUI:
                 config.get("icloud_ssh_host", "") or ""
             ).strip():
                 self.log("[!] iCloud 自动隧道模式需要配置 SSH 主机")
+                return
+        if config["email_provider"] == "outlook_email":
+            if not str(config.get("outlook_email_base_url", "") or "").strip():
+                self.log("[!] OutlookEmail 模式需要填写服务地址")
+                return
+            if not str(
+                config.get("outlook_email_login_password", "") or ""
+            ):
+                self.log("[!] OutlookEmail 模式需要填写 Web 登录密码")
                 return
         if (
             config.get("cpa_auto_add")
@@ -4925,6 +5164,9 @@ class GrokRegisterGUI:
                             f"[*] 下一个账号代理: {redact_proxy(bound_proxy) or '直连'}"
                         )
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
+                provider_claim_outcome = "failed"
+                provider_claim_detail = "注册流程未完成"
                 try:
                     email = ""
                     dev_token = ""
@@ -4965,6 +5207,11 @@ class GrokRegisterGUI:
                             msg = str(mail_exc)
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                                finalize_email_provider_claim(
+                                    "failed",
+                                    detail=msg,
+                                    log_callback=wlog,
+                                )
                                 restart_browser(log_callback=wlog)
                                 sleep_with_cancel(1, self.should_stop)
                                 continue
@@ -5007,6 +5254,8 @@ class GrokRegisterGUI:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
                     cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
                     self._record_success()
+                    provider_claim_outcome = "success"
+                    provider_claim_detail = "Grok 注册成功并已保存 SSO"
                     retry_count_for_slot = 0
                     i += 1
                     if cpa_ok:
@@ -5024,6 +5273,8 @@ class GrokRegisterGUI:
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
                 except RegistrationCancelled:
+                    provider_claim_outcome = "release"
+                    provider_claim_detail = "用户停止注册"
                     wlog("[!] 注册被用户停止")
                     break
                 except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
@@ -5037,13 +5288,28 @@ class GrokRegisterGUI:
                         f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
                     )
                     wlog("[!] 所有活跃 iCloud 账号当前均不可创建地址，已自动停止整批任务")
+                    provider_claim_detail = str(exc)
+                except outlook_email_provider.OutlookEmailPoolEmptyError as exc:
+                    kind = self._record_failure(exc)
+                    retry_count_for_slot = 0
+                    i += 1
+                    # 邮箱池耗尽属于批次级终止条件，避免后续 worker 继续空轮询。
+                    self.stop_requested = True
+                    provider_claim_detail = str(exc)
+                    wlog(
+                        f"[-] OutlookEmail 项目邮箱池已耗尽 "
+                        f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                    )
+                    wlog("[!] 当前项目没有可领取邮箱，已自动停止整批任务")
                 except EmailDomainRejected as exc:
+                    provider_claim_detail = str(exc)
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
                     wlog(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                     wlog("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 except AccountRetryNeeded as exc:
+                    provider_claim_detail = str(exc)
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         wlog(
@@ -5057,15 +5323,21 @@ class GrokRegisterGUI:
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    provider_claim_detail = str(exc)
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
                     wlog(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 finally:
                     try:
-                        retain_email_provider_alias(log_callback=wlog)
-                    except Exception as retain_exc:
-                        wlog(f"[!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}")
+                        finalize_email_provider_claim(
+                            provider_claim_outcome,
+                            detail=provider_claim_detail,
+                            log_callback=wlog,
+                            stopped=self.should_stop(),
+                        )
+                    except Exception as finalize_exc:
+                        wlog(f"[!] 邮箱领取状态结算异常: {finalize_exc}")
                     self.update_stats()
                     if self.should_stop():
                         break
@@ -5120,7 +5392,7 @@ def cli_log(message):
 
 
 def run_registration_cli(count):
-    """确保可选 Resin 隧道后执行 CLI 注册，并保留每次创建的 iCloud 别名。"""
+    """执行 CLI 注册，并按每轮结果结算当前邮箱提供商的资源状态。"""
     controller = CliStopController()
     try:
         validate_proxy_config()
@@ -5348,6 +5620,9 @@ def run_registration_cli(count):
                         return
                 retry = 0
                 while i < n and not controller.should_stop():
+                    # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
+                    provider_claim_outcome = "failed"
+                    provider_claim_detail = "注册流程未完成"
                     try:
                         # 同一 i 对应同一个 Resin 槽位，流程重试不会改变粘性身份。
                         bind_proxy_for_account(
@@ -5405,6 +5680,8 @@ def run_registration_cli(count):
                             sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
                         local_success += 1
+                        provider_claim_outcome = "success"
+                        provider_claim_detail = "Grok 注册成功并已保存 SSO"
                         i += 1
                         retry = 0
                         if cpa_ok:
@@ -5427,8 +5704,11 @@ def run_registration_cli(count):
                         if not is_resin_proxy_mode() and local_success % 2 == 0:
                             rotate_idx += 1
                     except RegistrationCancelled:
+                        provider_claim_outcome = "release"
+                        provider_claim_detail = "用户停止注册"
                         break
                     except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
+                        provider_claim_detail = str(exc)
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -5452,7 +5732,32 @@ def run_registration_cli(count):
                             worker=f"W{wid+1}",
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
+                    except outlook_email_provider.OutlookEmailPoolEmptyError as exc:
+                        provider_claim_detail = str(exc)
+                        kind = classify_failure(exc)
+                        local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                        local_fail += 1
+                        i += 1
+                        retry = 0
+                        controller.stop()
+                        cli_log(
+                            f"[W{wid+1}] [-] OutlookEmail 项目邮箱池已耗尽 "
+                            f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                        )
+                        cli_log(
+                            f"[W{wid+1}] [!] 当前项目没有可领取邮箱，"
+                            "已自动停止整批任务"
+                        )
+                        record_register_result(
+                            "fail",
+                            email if email else "",
+                            kind=kind,
+                            detail=str(exc)[:300],
+                            worker=f"W{wid+1}",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                     except EmailDomainRejected as exc:
+                        provider_claim_detail = str(exc)
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -5468,6 +5773,7 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                     except AccountRetryNeeded as exc:
+                        provider_claim_detail = str(exc)
                         retry += 1
                         if retry > max_slot_retry:
                             kind = classify_failure(exc)
@@ -5477,6 +5783,7 @@ def run_registration_cli(count):
                             retry = 0
                             cli_log(f"[W{wid+1}] [-] 卡住跳过: {exc}")
                     except Exception as exc:
+                        provider_claim_detail = str(exc)
                         msg = str(exc)
                         blank_ui = (
                             "inputs=none" in msg
@@ -5564,12 +5871,15 @@ def run_registration_cli(count):
                             rotate_idx += 1
                     finally:
                         try:
-                            retain_email_provider_alias(
-                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            finalize_email_provider_claim(
+                                provider_claim_outcome,
+                                detail=provider_claim_detail,
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                stopped=controller.should_stop(),
                             )
-                        except Exception as retain_exc:
+                        except Exception as finalize_exc:
                             cli_log(
-                                f"[W{wid+1}] [!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}"
+                                f"[W{wid+1}] [!] 邮箱领取状态结算异常: {finalize_exc}"
                             )
                         if i < n and not controller.should_stop():
                             try:
@@ -5715,6 +6025,9 @@ def run_registration_cli(count):
                         f"[*] 下一个账号代理: {redact_proxy(px) or '直连'}"
                     )
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
+            provider_claim_outcome = "failed"
+            provider_claim_detail = "注册流程未完成"
             try:
                 email = ""
                 dev_token = ""
@@ -5755,6 +6068,11 @@ def run_registration_cli(count):
                         msg = str(mail_exc)
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                             cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                            finalize_email_provider_claim(
+                                "failed",
+                                detail=msg,
+                                log_callback=cli_log,
+                            )
                             restart_browser(log_callback=cli_log)
                             sleep_with_cancel(1, controller.should_stop)
                             continue
@@ -5785,6 +6103,8 @@ def run_registration_cli(count):
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
+                provider_claim_outcome = "success"
+                provider_claim_detail = "Grok 注册成功并已保存 SSO"
                 retry_count_for_slot = 0
                 i += 1
                 if cpa_ok:
@@ -5798,9 +6118,12 @@ def run_registration_cli(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
+                provider_claim_outcome = "release"
+                provider_claim_detail = "用户停止注册"
                 cli_log("[!] 注册被停止")
                 break
             except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
+                provider_claim_detail = str(exc)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
@@ -5810,13 +6133,26 @@ def run_registration_cli(count):
                     f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
                 )
                 cli_log("[!] 所有活跃 iCloud 账号当前均不可创建地址，已自动停止整批任务")
+            except outlook_email_provider.OutlookEmailPoolEmptyError as exc:
+                provider_claim_detail = str(exc)
+                kind = _cli_record_failure(exc)
+                retry_count_for_slot = 0
+                i += 1
+                controller.stop()
+                cli_log(
+                    f"[-] OutlookEmail 项目邮箱池已耗尽 "
+                    f"[{FAIL_LABELS.get(kind, kind)}]: {exc}"
+                )
+                cli_log("[!] 当前项目没有可领取邮箱，已自动停止整批任务")
             except EmailDomainRejected as exc:
+                provider_claim_detail = str(exc)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 cli_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
+                provider_claim_detail = str(exc)
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -5828,15 +6164,21 @@ def run_registration_cli(count):
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             except Exception as exc:
+                provider_claim_detail = str(exc)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             finally:
                 try:
-                    retain_email_provider_alias(log_callback=cli_log)
-                except Exception as retain_exc:
-                    cli_log(f"[!] iCloud HME 隐私邮箱保留记录异常: {retain_exc}")
+                    finalize_email_provider_claim(
+                        provider_claim_outcome,
+                        detail=provider_claim_detail,
+                        log_callback=cli_log,
+                        stopped=controller.should_stop(),
+                    )
+                except Exception as finalize_exc:
+                    cli_log(f"[!] 邮箱领取状态结算异常: {finalize_exc}")
                 if controller.should_stop():
                     break
                 # 每轮结束只关浏览器，不立刻再开。
