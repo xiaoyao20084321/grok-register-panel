@@ -25,6 +25,10 @@ from browser_session import (
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+# Grok 首页地址用于从用户实际可见的登录入口开始恢复已有账号。
+GROK_HOME_URL = "https://grok.com/"
+# 邮箱登录直达地址仅在 Grok 首页入口未能正常推进时作为兜底。
+EMAIL_SIGNIN_URL = "https://accounts.x.ai/sign-in?redirect=grok-com&email=true"
 
 # 资料页 Cloudflare Turnstile：等待自动通过 + 智能点击，不调用 reset()
 CF_FIRST_RETRY_AFTER = 3.0   # 检测到 CF 后 3 秒即开始尝试
@@ -32,6 +36,8 @@ CF_RETRY_INTERVAL = 8.0      # 两次完整 getTurnstileToken 间隔（原 15s �
 CF_WAIT_LOG_INTERVAL = 5.0
 PROFILE_TIMEOUT = 45         # 资料页总超时（含 Turnstile；原 10s 过短）
 PROFILE_CF_MAX_ROUNDS = 3    # Turnstile 完整复用最大次数，超限换口
+# 点击资料提交按钮后等待页面进入登录或重定向阶段的最长秒数。
+PROFILE_SUBMIT_CONFIRM_TIMEOUT = 6
 
 _deps: Dict[str, Any] = {}
 
@@ -241,6 +247,67 @@ def _native_fill_profile(given_name: str, family_name: str, password: str) -> bo
             _native_type_element(secret[0], password),
         )
     )
+
+
+def _profile_submission_confirmed(
+    timeout=PROFILE_SUBMIT_CONFIRM_TIMEOUT,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """确认资料提交已经离开表单阶段，避免把未通过 Turnstile 的邮箱判为已用。
+
+    只有页面进入 Grok、出现正在登录/重定向提示，或离开 sign-up 路由且资料表单
+    已消失时才返回真；超时返回假，让调用方继续等待或重试提交。按钮点击后的短暂
+    裁决窗口不会被停止请求打断，避免把刚创建的账号对应邮箱错误释放。
+    """
+    deadline = time.time() + max(float(timeout or 0), 0.5)
+    last_state = "unknown"
+    while time.time() < deadline:
+        # 提交按钮已经点下后必须先裁决账号是否已创建；此处暂缓响应停止请求，
+        # 否则“点击成功后立刻停止”会把实际已占用的邮箱错误释放回池中。
+        refresh_active_page()
+        try:
+            state = page.run_js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const url = String(location.href || '').toLowerCase();
+const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+const compact = body.replace(/\s+/g, '').toLowerCase();
+const profileInputs = Array.from(document.querySelectorAll(
+  'input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], '
+  + 'input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], '
+  + 'input[data-testid="password"], input[name="password"], input[type="password"][autocomplete="new-password"]'
+));
+const formVisible = profileInputs.some((node) => isVisible(node) && !node.disabled);
+const signing = compact.includes('正在登录') || compact.includes('正在重定向')
+  || compact.includes('signingyouin') || compact.includes('signingin')
+  || compact.includes('loggingin') || compact.includes('redirecting');
+const onGrok = url.includes('grok.com');
+const leftSignup = url.includes('accounts.x.ai') && !url.includes('/sign-up');
+if (onGrok) return 'confirmed:grok';
+if (signing) return 'confirmed:redirecting';
+if (leftSignup && !formVisible && body.length > 0) return 'confirmed:left-signup';
+return formVisible ? 'pending:profile-visible' : 'pending:no-confirmation';
+                """
+            )
+        except Exception as exc:
+            last_state = f"error:{type(exc).__name__}"
+        else:
+            last_state = str(state or "unknown")
+            if last_state.startswith("confirmed:"):
+                if log_callback:
+                    log_callback(f"[*] 已确认注册资料提交成功: {last_state}")
+                return True
+        time.sleep(0.35)
+    if log_callback:
+        log_callback(f"[Debug] 资料提交后尚未进入登录重定向阶段: {last_state}")
+    return False
 
 
 def _dismiss_cookie_consent(log_callback=None):
@@ -1548,6 +1615,7 @@ def fill_profile_and_submit(timeout=None, log_callback=None, cancel_callback=Non
     cf_rounds = 0
 
     def _maybe_log_cf_wait(message, token_len):
+        """按 token 变化或固定间隔输出 Turnstile 等待心跳。"""
         nonlocal last_cf_log_at, last_logged_token_len
         if not log_callback:
             return
@@ -1562,6 +1630,7 @@ def fill_profile_and_submit(timeout=None, log_callback=None, cancel_callback=Non
             last_logged_token_len = token_key
 
     def _raise_profile_fail():
+        """根据最后页面状态抛出可分类的资料提交异常。"""
         if saw_cf_wait or str(last_state).startswith("wait-cf"):
             raise Exception(
                 f"资料页 Turnstile 超时: {last_state} "
@@ -1575,6 +1644,8 @@ def fill_profile_and_submit(timeout=None, log_callback=None, cancel_callback=Non
             raise Exception(f"资料页无提交按钮: {last_state}")
         if last_state == "fill-failed":
             raise Exception(f"资料页输入写入失败: {last_state}")
+        if last_state == "submit-unconfirmed":
+            raise Exception("资料页提交后未进入登录重定向阶段: submit-unconfirmed")
         raise Exception(f"最终注册页资料填写失败: {last_state}")
 
     while time.time() < deadline:
@@ -1817,7 +1888,21 @@ btn.focus(); btn.click(); return 'submitted';
         if submit_state == "submitted":
             if log_callback:
                 log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
-            return {"given_name": given_name, "family_name": family_name, "password": password}
+            # 点击按钮本身不代表服务端已经接收资料；必须观察到登录/重定向阶段，
+            # 否则 Turnstile 卡住时会错误地把尚未创建账号的邮箱永久结算。
+            if _profile_submission_confirmed(
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            ):
+                return {
+                    "given_name": given_name,
+                    "family_name": family_name,
+                    "password": password,
+                    "submitted": True,
+                }
+            last_state = "submit-unconfirmed"
+            sleep_with_cancel(0.5, cancel_callback)
+            continue
         wait_cf_since = None
         if isinstance(submit_state, str) and submit_state.startswith("no-submit-button") and log_callback:
             last_state = str(submit_state)
@@ -1828,6 +1913,171 @@ btn.focus(); btn.click(); return 'submitted';
         sleep_with_cancel(0.5, cancel_callback)
 
     _raise_profile_fail()
+
+
+def login_grok_with_email_password(
+    email,
+    password,
+    timeout=45,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """从 Grok 首页使用邮箱和密码登录已有账号并等待进入重定向阶段。
+
+    输入为已创建的 Grok 邮箱和登录密码；函数会产生真实登录请求，但不会读取、
+    返回或记录密码。返回值只包含登录后的页面地址，SSO 由调用方继续通过
+    ``wait_for_sso_cookie`` 获取。首页入口异常时会回退到官方邮箱登录地址。
+    """
+    normalized_email = str(email or "").strip()
+    normalized_password = str(password or "")
+    if not normalized_email or "@" not in normalized_email:
+        raise ValueError("SSO 恢复登录缺少有效邮箱")
+    if not normalized_password:
+        raise ValueError("SSO 恢复登录缺少 Grok 密码")
+
+    raise_if_cancelled(cancel_callback)
+    if active_browser() is None:
+        start_browser(log_callback=log_callback)
+    browser_obj = active_browser()
+    page_obj = active_page()
+    if page_obj is None:
+        page_obj = browser_obj.new_tab()
+        set_browser_session(browser_obj, page_obj)
+
+    if log_callback:
+        log_callback(f"[*] SSO 恢复：打开 Grok 登录页 ({normalized_email})")
+    page_obj.get(GROK_HOME_URL)
+    try:
+        page_obj.wait.doc_loaded()
+    except Exception:
+        pass
+    sleep_with_cancel(0.8, cancel_callback)
+
+    login_started = time.time()
+    deadline = login_started + max(float(timeout or 45), 15.0)
+    direct_fallback_used = False
+    email_candidates = []
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        refresh_active_page()
+        email_candidates = _native_input_candidates("email")
+        if email_candidates:
+            break
+        current_url = str(getattr(page, "url", "") or "")
+        if "accounts.x.ai" in current_url:
+            clicked = _native_click_action(
+                (
+                    "使用邮箱登录",
+                    "sign in with email",
+                    "login with email",
+                    "continue with email",
+                ),
+                deny_keywords=("注册", "sign up", "register"),
+            )
+            if clicked and log_callback:
+                log_callback("[*] SSO 恢复：已点击“使用邮箱登录”")
+        else:
+            clicked = _native_click_action(
+                ("登录", "sign in", "log in"),
+                deny_keywords=("注册", "sign up", "register", "google", "apple"),
+            )
+            if clicked and log_callback:
+                log_callback("[*] SSO 恢复：已点击 Grok“登录”")
+
+        # Grok SPA 偶发只渲染空壳；先走真实首页入口，迟迟无邮箱框时再使用官方直达页。
+        if not direct_fallback_used and time.time() - login_started >= 8:
+            direct_fallback_used = True
+            if log_callback:
+                log_callback("[!] Grok 登录入口未出现邮箱框，回退到官方邮箱登录页")
+            page.get(EMAIL_SIGNIN_URL)
+            try:
+                page.wait.doc_loaded()
+            except Exception:
+                pass
+        sleep_with_cancel(0.5, cancel_callback)
+    if not email_candidates:
+        raise Exception(
+            f"SSO 恢复登录失败：未找到邮箱输入框 url={str(getattr(page, 'url', '') or '')[:120]}"
+        )
+
+    if not _native_type_element(email_candidates[0], normalized_email):
+        raise Exception("SSO 恢复登录失败：邮箱输入写入失败")
+    if not _native_click_action(
+        ("下一步", "next", "continue"),
+        deny_keywords=("返回", "back", "注册", "sign up"),
+    ):
+        raise Exception("SSO 恢复登录失败：未找到邮箱页“下一步”按钮")
+    if log_callback:
+        log_callback("[*] SSO 恢复：邮箱已提交，等待密码输入框")
+
+    password_candidates = []
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        refresh_active_page()
+        password_candidates = _native_input_candidates("password")
+        if password_candidates:
+            break
+        sleep_with_cancel(0.4, cancel_callback)
+    if not password_candidates:
+        raise Exception(
+            f"SSO 恢复登录失败：未找到密码输入框 url={str(getattr(page, 'url', '') or '')[:120]}"
+        )
+    if not _native_type_element(password_candidates[0], normalized_password):
+        raise Exception("SSO 恢复登录失败：密码输入写入失败")
+    if not _native_click_action(
+        ("登录", "sign in", "log in"),
+        deny_keywords=(
+            "使用",
+            "with",
+            "google",
+            "apple",
+            "注册",
+            "sign up",
+            "返回",
+            "back",
+        ),
+    ):
+        raise Exception("SSO 恢复登录失败：未找到密码页“登录”按钮")
+    if log_callback:
+        log_callback("[*] SSO 恢复：密码已提交，等待 accounts.x.ai 重定向")
+
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        refresh_active_page()
+        current_url = str(getattr(page, "url", "") or "")
+        try:
+            body_text = str(
+                page.run_js(
+                    "return ((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').trim();"
+                )
+                or ""
+            )
+        except Exception:
+            body_text = ""
+        compact = re.sub(r"\s+", "", body_text).lower()
+        if "grok.com" in current_url:
+            if log_callback:
+                log_callback("[*] SSO 恢复：邮箱密码登录成功，已返回 Grok")
+            return {"url": current_url, "redirecting": False}
+        if "正在重定向" in compact or "redirecting" in compact:
+            if log_callback:
+                log_callback("[*] SSO 恢复：登录成功，正在等待返回 Grok")
+            return {"url": current_url, "redirecting": True}
+        error_patterns = (
+            "密码不正确",
+            "邮箱或密码不正确",
+            "找不到账户",
+            "账户不存在",
+            "incorrectpassword",
+            "invalidemailorpassword",
+            "accountnotfound",
+        )
+        if any(pattern in compact for pattern in error_patterns):
+            raise Exception("SSO 恢复登录失败：xAI 拒绝了邮箱或密码")
+        sleep_with_cancel(0.4, cancel_callback)
+    raise Exception(
+        f"SSO 恢复登录超时：密码已提交但未进入重定向 url={str(getattr(page, 'url', '') or '')[:120]}"
+    )
 
 
 def wait_for_sso_cookie(timeout=10, log_callback=None, cancel_callback=None):

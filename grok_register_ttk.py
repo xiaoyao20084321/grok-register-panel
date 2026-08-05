@@ -83,6 +83,7 @@ from register_flow import (
     getTurnstileToken,
     build_profile,
     fill_profile_and_submit,
+    login_grok_with_email_password,
     wait_for_sso_cookie,
 )
 
@@ -93,9 +94,19 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 # 注册产物目录（账号 / 邮箱凭证 / 待重转 SSO），避免堆在项目根目录
 ACCOUNTS_DIR = os.path.join(APP_DIR, "accounts")
 MEMORY_CLEANUP_INTERVAL = 5
+# 待恢复 SSO 队列文件保存已建号但尚未取得 Cookie 的邮箱与 Grok 密码。
+SSO_RECOVERY_FILE_NAME = "sso_recovery_pending.jsonl"
 
 _session_log_path = None
 _session_log_lock = threading.Lock()
+# 待恢复队列锁保护多 worker 的原子读取、更新和任务领取。
+_SSO_RECOVERY_LOCK = threading.RLock()
+# 当前进程正在恢复的邮箱集合用于避免并发 worker 重复登录同一账号。
+_SSO_RECOVERY_ACTIVE_EMAILS = set()
+# 当前批次已经尝试过的邮箱集合保证每个待恢复账号每轮最多执行一次。
+_SSO_RECOVERY_ATTEMPTED_EMAILS = set()
+# 当前批次启动时的队列快照避免本轮新产生的 SSO 超时账号被立即再次登录。
+_SSO_RECOVERY_ELIGIBLE_EMAILS = set()
 
 
 def ensure_accounts_dir():
@@ -125,6 +136,174 @@ def accounts_side_file(name):
     """accounts/ 下的附属文件路径（mail_credentials / sso_pending 等）。"""
     ensure_accounts_dir()
     return os.path.join(ACCOUNTS_DIR, name)
+
+
+def sso_recovery_file_path():
+    """返回待恢复 SSO 队列文件路径，并确保账号目录已经创建。"""
+    return accounts_side_file(SSO_RECOVERY_FILE_NAME)
+
+
+def _load_sso_recovery_records_unlocked():
+    """在调用方持锁时读取并按邮箱去重待恢复记录，损坏行会被安全跳过。"""
+    path = sso_recovery_file_path()
+    if not os.path.exists(path):
+        return []
+    records_by_email = {}
+    try:
+        with open(path, "r", encoding="utf-8") as recovery_file:
+            for raw_line in recovery_file:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                email = str(record.get("email", "") or "").strip().lower()
+                password = str(record.get("password", "") or "")
+                if not email or "@" not in email or not password:
+                    continue
+                normalized = dict(record)
+                normalized["email"] = email
+                normalized["password"] = password
+                records_by_email[email] = normalized
+    except OSError:
+        return []
+    return list(records_by_email.values())
+
+
+def _write_sso_recovery_records_unlocked(records):
+    """在调用方持锁时原子重写待恢复队列，并把敏感文件权限限制为 0600。"""
+    path = sso_recovery_file_path()
+    temporary_path = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as recovery_file:
+            for record in records:
+                recovery_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            recovery_file.flush()
+            os.fsync(recovery_file.fileno())
+        try:
+            os.chmod(temporary_path, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def prepare_sso_recovery_run():
+    """在新批次开始时冻结待恢复快照，使历史记录本轮最多尝试一次。"""
+    with _SSO_RECOVERY_LOCK:
+        _SSO_RECOVERY_ACTIVE_EMAILS.clear()
+        _SSO_RECOVERY_ATTEMPTED_EMAILS.clear()
+        _SSO_RECOVERY_ELIGIBLE_EMAILS.clear()
+        _SSO_RECOVERY_ELIGIBLE_EMAILS.update(
+            str(record.get("email", "") or "").strip().lower()
+            for record in _load_sso_recovery_records_unlocked()
+            if str(record.get("email", "") or "").strip()
+        )
+
+
+def queue_sso_recovery(email, password, detail="", log_callback=None):
+    """保存已建号但缺少 SSO 的登录凭据；重复邮箱只更新状态而不重复写入。"""
+    normalized_email = str(email or "").strip().lower()
+    normalized_password = str(password or "")
+    if not normalized_email or "@" not in normalized_email or not normalized_password:
+        raise ValueError("待恢复 SSO 记录缺少邮箱或 Grok 密码")
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _SSO_RECOVERY_LOCK:
+        records = _load_sso_recovery_records_unlocked()
+        existing = next(
+            (item for item in records if item.get("email") == normalized_email),
+            None,
+        )
+        if existing is None:
+            existing = {
+                "email": normalized_email,
+                "password": normalized_password,
+                "created_at": now,
+                "updated_at": now,
+                "attempts": 0,
+                "last_error": str(detail or "")[:500],
+            }
+            records.append(existing)
+        else:
+            existing["password"] = normalized_password
+            existing["updated_at"] = now
+            if detail:
+                existing["last_error"] = str(detail)[:500]
+        _write_sso_recovery_records_unlocked(records)
+    if log_callback:
+        log_callback(f"[*] 已保存待恢复 SSO 账号: {normalized_email}")
+    return True
+
+
+def remove_sso_recovery(email, log_callback=None):
+    """在取得 SSO 后从登录恢复队列删除指定邮箱，避免下次启动重复登录。"""
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return False
+    with _SSO_RECOVERY_LOCK:
+        records = _load_sso_recovery_records_unlocked()
+        remaining = [
+            item for item in records if item.get("email") != normalized_email
+        ]
+        removed = len(remaining) != len(records)
+        if removed:
+            _write_sso_recovery_records_unlocked(remaining)
+        _SSO_RECOVERY_ACTIVE_EMAILS.discard(normalized_email)
+    if removed and log_callback:
+        log_callback(f"[*] 已完成 SSO 恢复并移出队列: {normalized_email}")
+    return removed
+
+
+def claim_next_sso_recovery():
+    """为当前 worker 领取本批次尚未尝试的待恢复账号，队列为空时返回空值。"""
+    with _SSO_RECOVERY_LOCK:
+        for record in _load_sso_recovery_records_unlocked():
+            email = str(record.get("email", "") or "").strip().lower()
+            if (
+                not email
+                or email not in _SSO_RECOVERY_ELIGIBLE_EMAILS
+                or email in _SSO_RECOVERY_ACTIVE_EMAILS
+                or email in _SSO_RECOVERY_ATTEMPTED_EMAILS
+            ):
+                continue
+            _SSO_RECOVERY_ACTIVE_EMAILS.add(email)
+            _SSO_RECOVERY_ATTEMPTED_EMAILS.add(email)
+            return dict(record)
+    return None
+
+
+def finish_sso_recovery_attempt(email, error=""):
+    """结束一次恢复领取；失败时累计次数并保留记录供下次批次再次尝试。"""
+    normalized_email = str(email or "").strip().lower()
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _SSO_RECOVERY_LOCK:
+        records = _load_sso_recovery_records_unlocked()
+        changed = False
+        for record in records:
+            if record.get("email") != normalized_email:
+                continue
+            record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+            record["updated_at"] = now
+            record["last_error"] = redact_sensitive_text(error)[:500]
+            changed = True
+            break
+        if changed:
+            _write_sso_recovery_records_unlocked(records)
+        _SSO_RECOVERY_ACTIVE_EMAILS.discard(normalized_email)
+    return changed
 
 
 def initialize_session_log(log_dir=None, now=None):
@@ -512,6 +691,7 @@ def classify_failure(exc) -> str:
         "资料页表单未就绪" in msg
         or "资料页无提交按钮" in msg
         or "资料页输入写入失败" in msg
+        or "资料页提交后未进入登录重定向阶段" in msg
         or "最终注册页资料填写失败" in msg
     ):
         return FAIL_PROFILE
@@ -1983,6 +2163,220 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
     return all_delivered
 
 
+def persist_submitted_outlook_account(email, profile, log_callback=None):
+    """在确认资料已提交后保存恢复凭据，并立即把 OutlookEmail 项目邮箱标记成功。
+
+    队列先于远端结算写入，确保进程随后在 SSO 等待阶段退出时仍能通过邮箱密码
+    恢复账号；非 OutlookEmail 提供商不会产生队列或结算副作用。
+    """
+    if get_email_provider() != "outlook_email":
+        return False
+    password = str((profile or {}).get("password", "") or "")
+    try:
+        queue_sso_recovery(
+            email,
+            password,
+            detail="注册资料已提交，等待首次获取 SSO",
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        # 账号已经创建，不能因本地文件异常把邮箱释放；继续等待当前浏览器直接取得 SSO。
+        if log_callback:
+            log_callback(f"[!] 待恢复 SSO 凭据保存失败，将继续当前取 SSO 流程: {exc}")
+    try:
+        finalize_email_provider_claim(
+            "success",
+            detail="Grok 注册资料已提交，邮箱已被账号占用",
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        # 远端结算失败不应打断已经创建的账号；外层 finally 会使用 success 再重试一次。
+        if log_callback:
+            log_callback(f"[!] OutlookEmail 已建号结算暂时失败，将在本轮结束重试: {exc}")
+        return False
+    return True
+
+
+def save_grok_account_file(email, password, sso, file_lock=None):
+    """把邮箱、Grok 密码和 SSO 写入独立账号文件，并限制文件权限为 0600。"""
+    normalized_email = str(email or "").strip()
+    normalized_password = str(password or "")
+    normalized_sso = _normalize_sso_token(sso)
+    if not normalized_email or not normalized_password or not normalized_sso:
+        raise ValueError("保存 Grok 账号时缺少邮箱、密码或 SSO")
+    path = account_file_for_email(normalized_email)
+    line = f"{normalized_email}----{normalized_password}----{normalized_sso}\n"
+
+    def _write_account_file():
+        """执行单文件覆盖写入，并在支持权限位的平台限制其他用户读取。"""
+        with open(path, "w", encoding="utf-8", newline="\n") as account_file:
+            account_file.write(line)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    if file_lock:
+        with file_lock:
+            _write_account_file()
+    else:
+        _write_account_file()
+    return path
+
+
+def finalize_acquired_sso_account(
+    email,
+    password,
+    sso,
+    log_callback=None,
+    file_lock=None,
+):
+    """持久化已取得的 SSO 并执行现有 OAuth/Build 交付，返回全部所选交付是否成功。
+
+    一旦取得 SSO 就移出邮箱密码恢复队列；即使风控检查、文件写入或 Build 换取
+    失败，也只保留现有 SSO 待处理记录，不会在下次注册时重复邮箱密码登录。
+    """
+    normalized_sso = _normalize_sso_token(sso)
+    if not normalized_sso:
+        raise ValueError("已获取 SSO 的账号缺少有效 Cookie")
+    try:
+        ensure_sso_oauth_eligible(
+            normalized_sso,
+            email=email,
+            log_callback=log_callback,
+        )
+    except RegistrationRiskDenied:
+        remove_sso_recovery(email, log_callback=log_callback)
+        raise
+    except Exception:
+        _append_sso_pending(email, normalized_sso, log_callback=log_callback)
+        remove_sso_recovery(email, log_callback=log_callback)
+        raise
+    try:
+        save_grok_account_file(
+            email,
+            password,
+            normalized_sso,
+            file_lock=file_lock,
+        )
+    except Exception as file_exc:
+        _append_sso_pending(email, normalized_sso, log_callback=log_callback)
+        remove_sso_recovery(email, log_callback=log_callback)
+        raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+    remove_sso_recovery(email, log_callback=log_callback)
+    return add_sso_to_cpa(
+        normalized_sso,
+        email=email,
+        log_callback=log_callback,
+    )
+
+
+def recover_pending_sso_accounts(log_callback=None, cancel_callback=None):
+    """逐个登录本批次领取的待恢复账号，成功后保存 SSO 并执行一次现有交付流程。
+
+    每条记录在一个程序批次中最多尝试一次。临时失败会保留邮箱和密码并累计错误，
+    不阻塞后续正常注册；每个恢复账号使用独立浏览器会话，避免账号 Cookie 串号。
+    """
+    if get_email_provider() != "outlook_email":
+        return {"success": 0, "failed": 0}
+    recovered = 0
+    failed = 0
+    while True:
+        raise_if_cancelled(cancel_callback)
+        record = claim_next_sso_recovery()
+        if not record:
+            break
+        email = str(record.get("email", "") or "").strip().lower()
+        password = str(record.get("password", "") or "")
+        sso_acquired = False
+        if log_callback:
+            log_callback(
+                f"--- 恢复待获取 SSO 账号: {email} "
+                f"(历史尝试 {int(record.get('attempts', 0) or 0)} 次) ---"
+            )
+        try:
+            try:
+                stop_browser()
+            except Exception:
+                pass
+            start_browser(log_callback=log_callback)
+            login_grok_with_email_password(
+                email,
+                password,
+                timeout=45,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            sso = wait_for_sso_cookie(
+                timeout=35,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            sso_acquired = True
+            delivery_ok = finalize_acquired_sso_account(
+                email,
+                password,
+                sso,
+                log_callback=log_callback,
+            )
+            # finalize_acquired_sso_account 已删除磁盘队列；这里再次调用只清理并发领取状态。
+            remove_sso_recovery(email)
+            recovered += 1
+            record_register_result(
+                "ok",
+                email,
+                kind="sso_recovered",
+                detail=(
+                    "邮箱密码登录恢复 SSO 成功"
+                    if delivery_ok
+                    else "邮箱密码登录恢复 SSO 成功，所选 auth 输出存在失败"
+                ),
+                log_callback=log_callback,
+            )
+            if log_callback:
+                suffix = "" if delivery_ok else "（所选 auth 输出存在失败）"
+                log_callback(f"[+] SSO 恢复成功{suffix}: {email}")
+        except RegistrationCancelled:
+            if sso_acquired:
+                remove_sso_recovery(email, log_callback=log_callback)
+            else:
+                finish_sso_recovery_attempt(email, "用户停止 SSO 恢复")
+            raise
+        except Exception as exc:
+            failed += 1
+            if sso_acquired:
+                # SSO 已取得后无论风控、保存或 Build 如何结束，都不再回到登录恢复队列。
+                remove_sso_recovery(email, log_callback=log_callback)
+            else:
+                finish_sso_recovery_attempt(email, str(exc))
+            kind = classify_failure(exc)
+            record_register_result(
+                "fail",
+                email,
+                kind=kind,
+                detail=str(exc)[:300],
+                log_callback=log_callback,
+            )
+            if log_callback:
+                if sso_acquired:
+                    log_callback(
+                        f"[!] 已取得 SSO，但后续保存或 auth 输出失败；"
+                        f"不再自动登录恢复: {email} | {exc}"
+                    )
+                else:
+                    log_callback(
+                        f"[!] SSO 恢复本轮失败，已保留到下次启动: {email} | {exc}"
+                    )
+        finally:
+            try:
+                stop_browser()
+            except Exception:
+                pass
+    if log_callback and (recovered or failed):
+        log_callback(f"[*] 待恢复 SSO 本轮结束：成功 {recovered} | 失败 {failed}")
+    return {"success": recovered, "failed": failed}
+
+
 # create_browser_options -> browser_session
 
 def _build_request_kwargs(**kwargs):
@@ -2518,7 +2912,11 @@ def finalize_email_provider_claim(
     log_callback=None,
     stopped=False,
 ):
-    """按注册结果结算项目邮箱；批次停止时释放尚未完成的领取。"""
+    """按注册阶段结算项目邮箱；停止时只释放资料尚未提交的领取。
+
+    ``success`` 表示资料已确认提交且邮箱已被 Grok 账号占用，停止任务也必须保留；
+    ``release`` 表示账号尚未创建，可恢复为 ``toClaim``；``failed`` 仅用于永久拒绝。
+    """
     provider = get_email_provider()
     if provider == "outlook_email":
         if stopped and str(outcome or "").strip().lower() == "failed":
@@ -5039,6 +5437,7 @@ class GrokRegisterGUI:
         startup_resin_generation=0,
     ):
         """协调 GUI worker，并让首个 worker 复用启动检查通过的 Resin 代次。"""
+        prepare_sso_recovery_run()
         # 并发数不超过任务数，避免空 worker 白开浏览器
         workers = max(1, min(int(workers or 1), 24, int(count or 1)))
         # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -5129,6 +5528,10 @@ class GrokRegisterGUI:
                 )
             else:
                 wlog(f"[*] 账号代理已绑定: {redact_proxy(bound_proxy) or '直连'}")
+            recover_pending_sso_accounts(
+                log_callback=wlog,
+                cancel_callback=self.should_stop,
+            )
             try:
                 start_browser(log_callback=wlog)
             except Exception as boot_exc:
@@ -5164,9 +5567,9 @@ class GrokRegisterGUI:
                             f"[*] 下一个账号代理: {redact_proxy(bound_proxy) or '直连'}"
                         )
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
-                provider_claim_outcome = "failed"
-                provider_claim_detail = "注册流程未完成"
+                # 邮箱领取后默认释放；只有确认资料已提交才改为成功，永久拒绝才改为失败。
+                provider_claim_outcome = "release"
+                provider_claim_detail = "注册资料尚未确认提交，释放邮箱供下次使用"
                 try:
                     email = ""
                     dev_token = ""
@@ -5208,7 +5611,7 @@ class GrokRegisterGUI:
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                                 finalize_email_provider_claim(
-                                    "failed",
+                                    "release",
                                     detail=msg,
                                     log_callback=wlog,
                                 )
@@ -5225,34 +5628,31 @@ class GrokRegisterGUI:
                         log_callback=wlog, cancel_callback=self.should_stop
                     )
                     wlog(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    # 资料提交已被页面确认，邮箱从此不可重新注册；SSO 超时改走登录恢复。
+                    provider_claim_outcome = "success"
+                    provider_claim_detail = "Grok 注册资料已提交，等待获取 SSO"
+                    persist_submitted_outlook_account(
+                        email,
+                        profile,
+                        log_callback=wlog,
+                    )
                     wlog("[*] 5. 等待 sso cookie")
                     sso = wait_for_sso_cookie(
                         log_callback=wlog, cancel_callback=self.should_stop
                     )
-                    ensure_sso_oauth_eligible(sso, email=email, log_callback=wlog)
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        # 以邮箱命名单独保存
-                        email_file = account_file_for_email(email)
-                        alock = getattr(self, "_accounts_lock", None)
-                        if alock:
-                            with alock:
-                                with open(email_file, "w", encoding="utf-8") as f:
-                                    f.write(line)
-                        else:
-                            with open(email_file, "w", encoding="utf-8") as f:
-                                f.write(line)
-                    except Exception as file_exc:
-                        wlog(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
-                        _append_sso_pending(email, sso, log_callback=wlog)
-                        raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                    cpa_ok = finalize_acquired_sso_account(
+                        email,
+                        profile.get("password", ""),
+                        sso,
+                        log_callback=wlog,
+                        file_lock=getattr(self, "_accounts_lock", None),
+                    )
                     lock = getattr(self, "_stats_lock", None)
                     if lock:
                         with lock:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
-                    cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
                     self._record_success()
                     provider_claim_outcome = "success"
                     provider_claim_detail = "Grok 注册成功并已保存 SSO"
@@ -5273,8 +5673,11 @@ class GrokRegisterGUI:
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
                 except RegistrationCancelled:
-                    provider_claim_outcome = "release"
-                    provider_claim_detail = "用户停止注册"
+                    if provider_claim_outcome != "success":
+                        provider_claim_outcome = "release"
+                        provider_claim_detail = "用户停止注册，资料尚未提交"
+                    else:
+                        provider_claim_detail = "用户停止注册，账号已建号并保留待恢复 SSO"
                     wlog("[!] 注册被用户停止")
                     break
                 except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
@@ -5302,6 +5705,7 @@ class GrokRegisterGUI:
                     )
                     wlog("[!] 当前项目没有可领取邮箱，已自动停止整批任务")
                 except EmailDomainRejected as exc:
+                    provider_claim_outcome = "failed"
                     provider_claim_detail = str(exc)
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
@@ -5394,6 +5798,7 @@ def cli_log(message):
 def run_registration_cli(count):
     """执行 CLI 注册，并按每轮结果结算当前邮箱提供商的资源状态。"""
     controller = CliStopController()
+    prepare_sso_recovery_run()
     try:
         validate_proxy_config()
     except ValueError as proxy_exc:
@@ -5567,6 +5972,10 @@ def run_registration_cli(count):
                     cli_log(
                         f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px) or '直连'}"
                     )
+                recover_pending_sso_accounts(
+                    log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                    cancel_callback=controller.should_stop,
+                )
                 try:
                     start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
@@ -5620,9 +6029,9 @@ def run_registration_cli(count):
                         return
                 retry = 0
                 while i < n and not controller.should_stop():
-                    # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
-                    provider_claim_outcome = "failed"
-                    provider_claim_detail = "注册流程未完成"
+                    # 邮箱领取后默认释放；只有确认资料已提交才改为成功，永久拒绝才改为失败。
+                    provider_claim_outcome = "release"
+                    provider_claim_detail = "注册资料尚未确认提交，释放邮箱供下次使用"
                     try:
                         # 同一 i 对应同一个 Resin 槽位，流程重试不会改变粘性身份。
                         bind_proxy_for_account(
@@ -5650,34 +6059,24 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
+                        # 资料提交已确认后立即结算邮箱并保存登录恢复凭据。
+                        provider_claim_outcome = "success"
+                        provider_claim_detail = "Grok 注册资料已提交，等待获取 SSO"
+                        persist_submitted_outlook_account(
+                            email,
+                            profile,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         sso = wait_for_sso_cookie(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        ensure_sso_oauth_eligible(
+                        cpa_ok = finalize_acquired_sso_account(
+                            email,
+                            profile.get("password", ""),
                             sso,
-                            email=email,
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                        )
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        try:
-                            with accounts_lock:
-                                # 以邮箱命名单独保存
-                                email_file = account_file_for_email(email)
-                                with open(email_file, "w", encoding="utf-8") as f:
-                                    f.write(line)
-                        except Exception as file_exc:
-                            cli_log(
-                                f"[W{wid+1}] [!] 保存账号文件失败，当前账号不计为成功: {file_exc}"
-                            )
-                            _append_sso_pending(
-                                email,
-                                sso,
-                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            )
-                            raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                        cpa_ok = add_sso_to_cpa(
-                            sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            file_lock=accounts_lock,
                         )
                         local_success += 1
                         provider_claim_outcome = "success"
@@ -5704,8 +6103,11 @@ def run_registration_cli(count):
                         if not is_resin_proxy_mode() and local_success % 2 == 0:
                             rotate_idx += 1
                     except RegistrationCancelled:
-                        provider_claim_outcome = "release"
-                        provider_claim_detail = "用户停止注册"
+                        if provider_claim_outcome != "success":
+                            provider_claim_outcome = "release"
+                            provider_claim_detail = "用户停止注册，资料尚未提交"
+                        else:
+                            provider_claim_detail = "用户停止注册，账号已建号并保留待恢复 SSO"
                         break
                     except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
                         provider_claim_detail = str(exc)
@@ -5757,6 +6159,7 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                     except EmailDomainRejected as exc:
+                        provider_claim_outcome = "failed"
                         provider_claim_detail = str(exc)
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
@@ -5806,6 +6209,7 @@ def run_registration_cli(count):
                         profile_soft = (
                             "资料页表单未就绪" in msg
                             or "资料页无提交按钮" in msg
+                            or "资料页提交后未进入登录重定向阶段" in msg
                         )
                         if (blank_ui or proxy_dead or turnstile_stuck or profile_soft) and retry < max_slot_retry:
                             retry += 1
@@ -5996,6 +6400,10 @@ def run_registration_cli(count):
             )
         else:
             cli_log(f"[*] 账号代理已绑定: {redact_proxy(px) or '直连'}")
+        recover_pending_sso_accounts(
+            log_callback=cli_log,
+            cancel_callback=controller.should_stop,
+        )
         try:
             start_browser(log_callback=cli_log)
         except Exception as boot_exc:
@@ -6025,9 +6433,9 @@ def run_registration_cli(count):
                         f"[*] 下一个账号代理: {redact_proxy(px) or '直连'}"
                     )
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            # 每轮先按失败结算；只有完整成功或用户停止分支会改写最终动作。
-            provider_claim_outcome = "failed"
-            provider_claim_detail = "注册流程未完成"
+            # 邮箱领取后默认释放；只有确认资料已提交才改为成功，永久拒绝才改为失败。
+            provider_claim_outcome = "release"
+            provider_claim_detail = "注册资料尚未确认提交，释放邮箱供下次使用"
             try:
                 email = ""
                 dev_token = ""
@@ -6069,7 +6477,7 @@ def run_registration_cli(count):
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                             cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                             finalize_email_provider_claim(
-                                "failed",
+                                "release",
                                 detail=msg,
                                 log_callback=cli_log,
                             )
@@ -6086,22 +6494,24 @@ def run_registration_cli(count):
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
                 cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                # 资料提交已被页面确认，邮箱从此不可重新注册；SSO 超时改走登录恢复。
+                provider_claim_outcome = "success"
+                provider_claim_detail = "Grok 注册资料已提交，等待获取 SSO"
+                persist_submitted_outlook_account(
+                    email,
+                    profile,
+                    log_callback=cli_log,
+                )
                 cli_log("[*] 5. 等待 sso cookie")
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
-                ensure_sso_oauth_eligible(sso, email=email, log_callback=cli_log)
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    # 以邮箱命名单独保存
-                    email_file = account_file_for_email(email)
-                    with open(email_file, "w", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
-                    _append_sso_pending(email, sso, log_callback=cli_log)
-                    raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                cpa_ok = finalize_acquired_sso_account(
+                    email,
+                    profile.get("password", ""),
+                    sso,
+                    log_callback=cli_log,
+                )
                 success_count += 1
                 provider_claim_outcome = "success"
                 provider_claim_detail = "Grok 注册成功并已保存 SSO"
@@ -6118,8 +6528,11 @@ def run_registration_cli(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
-                provider_claim_outcome = "release"
-                provider_claim_detail = "用户停止注册"
+                if provider_claim_outcome != "success":
+                    provider_claim_outcome = "release"
+                    provider_claim_detail = "用户停止注册，资料尚未提交"
+                else:
+                    provider_claim_detail = "用户停止注册，账号已建号并保留待恢复 SSO"
                 cli_log("[!] 注册被停止")
                 break
             except icloud_hme_provider.ICloudHMEAddressLimitError as exc:
@@ -6145,6 +6558,7 @@ def run_registration_cli(count):
                 )
                 cli_log("[!] 当前项目没有可领取邮箱，已自动停止整批任务")
             except EmailDomainRejected as exc:
+                provider_claim_outcome = "failed"
                 provider_claim_detail = str(exc)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
