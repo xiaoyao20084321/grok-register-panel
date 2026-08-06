@@ -143,6 +143,12 @@ def sso_recovery_file_path():
     return accounts_side_file(SSO_RECOVERY_FILE_NAME)
 
 
+def get_sso_recovery_count():
+    """返回当前磁盘队列中的有效待恢复账号数量，不读取或暴露密码内容。"""
+    with _SSO_RECOVERY_LOCK:
+        return len(_load_sso_recovery_records_unlocked())
+
+
 def _load_sso_recovery_records_unlocked():
     """在调用方持锁时读取并按邮箱去重待恢复记录，损坏行会被安全跳过。"""
     path = sso_recovery_file_path()
@@ -202,7 +208,7 @@ def _write_sso_recovery_records_unlocked(records):
 
 
 def prepare_sso_recovery_run():
-    """在新批次开始时冻结待恢复快照，使历史记录本轮最多尝试一次。"""
+    """在独立恢复任务开始时冻结队列快照，使每个账号本轮最多尝试一次。"""
     with _SSO_RECOVERY_LOCK:
         _SSO_RECOVERY_ACTIVE_EMAILS.clear()
         _SSO_RECOVERY_ATTEMPTED_EMAILS.clear()
@@ -249,7 +255,7 @@ def queue_sso_recovery(email, password, detail="", log_callback=None):
 
 
 def remove_sso_recovery(email, log_callback=None):
-    """在取得 SSO 后从登录恢复队列删除指定邮箱，避免下次启动重复登录。"""
+    """在取得 SSO 后从登录恢复队列删除指定邮箱，避免下次恢复任务重复登录。"""
     normalized_email = str(email or "").strip().lower()
     if not normalized_email:
         return False
@@ -286,7 +292,7 @@ def claim_next_sso_recovery():
 
 
 def finish_sso_recovery_attempt(email, error=""):
-    """结束一次恢复领取；失败时累计次数并保留记录供下次批次再次尝试。"""
+    """结束一次恢复领取；失败时累计次数并保留记录供下次独立任务再次尝试。"""
     normalized_email = str(email or "").strip().lower()
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with _SSO_RECOVERY_LOCK:
@@ -2272,13 +2278,12 @@ def finalize_acquired_sso_account(
 
 
 def recover_pending_sso_accounts(log_callback=None, cancel_callback=None):
-    """逐个登录本批次领取的待恢复账号，成功后保存 SSO 并执行一次现有交付流程。
+    """逐个登录独立任务领取的待恢复账号，成功后保存 SSO 并执行现有交付流程。
 
     每条记录在一个程序批次中最多尝试一次。临时失败会保留邮箱和密码并累计错误，
-    不阻塞后续正常注册；每个恢复账号使用独立浏览器会话，避免账号 Cookie 串号。
+    供用户再次点击恢复按钮；每个恢复账号使用独立浏览器会话，避免 Cookie 串号。
+    该流程只使用本地保存的 Grok 凭据，不依赖当前邮箱提供商或邮箱 API。
     """
-    if get_email_provider() != "outlook_email":
-        return {"success": 0, "failed": 0}
     recovered = 0
     failed = 0
     while True:
@@ -2365,7 +2370,7 @@ def recover_pending_sso_accounts(log_callback=None, cancel_callback=None):
                     )
                 else:
                     log_callback(
-                        f"[!] SSO 恢复本轮失败，已保留到下次启动: {email} | {exc}"
+                        f"[!] SSO 恢复本轮失败，已保留供下次点击恢复: {email} | {exc}"
                     )
         finally:
             try:
@@ -3699,6 +3704,8 @@ class GrokRegisterGUI:
         self.fail_count = 0
         self.results = []
         self.stop_requested = False
+        # active_task_kind 区分正常注册与独立 SSO 恢复，用于按钮状态和停止日志。
+        self.active_task_kind = ""
         self.ui_queue = queue.Queue()
         self.accounts_output_file = ""
         self.setup_ui()
@@ -4790,6 +4797,13 @@ class GrokRegisterGUI:
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
         self.start_btn.pack(side=tk.LEFT, padx=5)
+        # sso_recovery_btn 只处理本地恢复队列，按钮数字随有效记录数量动态更新。
+        self.sso_recovery_btn = tk_button(
+            btn_frame,
+            text="重新获取未获取到的SSO 账号（0）",
+            command=self.start_sso_recovery,
+        )
+        self.sso_recovery_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         self.close_browser_on_stop_var = tk.BooleanVar(
@@ -4805,6 +4819,7 @@ class GrokRegisterGUI:
         self.check_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self._refresh_sso_recovery_button()
 
         status_frame = tk.Frame(main_frame, bg=UI_BG)
         status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
@@ -5139,17 +5154,144 @@ class GrokRegisterGUI:
         else:
             self.success_count += 1
 
+    def _refresh_sso_recovery_button(self):
+        """刷新独立恢复按钮的队列数量，并在无任务时按数量决定是否可点击。"""
+        if self._queue_ui_call(self._refresh_sso_recovery_button):
+            return
+        pending_count = get_sso_recovery_count()
+        self.sso_recovery_btn.config(
+            text=f"重新获取未获取到的SSO 账号（{pending_count}）"
+        )
+        if not self.is_running:
+            self.sso_recovery_btn.config(
+                state=tk.NORMAL if pending_count > 0 else tk.DISABLED
+            )
+
     def _set_running_ui(self, running):
+        """统一切换注册与 SSO 恢复任务的互斥按钮和状态栏显示。"""
         if self._queue_ui_call(self._set_running_ui, running):
             return
         self.is_running = running
         self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.sso_recovery_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
+        if not running:
+            self.active_task_kind = ""
+            self._refresh_sso_recovery_button()
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
+
+    def start_sso_recovery(self):
+        """校验代理与 SSO 输出配置，并启动不依赖邮箱 API 的独立恢复任务。"""
+        if self.is_running:
+            self.log("[!] 当前已有任务在运行")
+            return
+        pending_count = get_sso_recovery_count()
+        if pending_count <= 0:
+            self.log("[*] 当前没有未获取到 SSO 的待处理账号")
+            self._refresh_sso_recovery_button()
+            return
+
+        config["debug_mode"] = bool(self.debug_mode_var.get())
+        config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
+        config["log_level"] = (self.log_level_var.get().strip() or "info").lower()
+        try:
+            self._apply_proxy_ui_config()
+            validate_proxy_config()
+        except ValueError as proxy_exc:
+            self.log(f"[!] 代理配置无效: {proxy_exc}")
+            return
+        self._apply_auth_output_ui_config()
+        if (
+            config.get("cpa_auto_add")
+            and any(get_auth_output_selection())
+            and not has_selected_auth_output_target()
+        ):
+            self.log("[!] 已开启 SSO→auth，但勾选的输出目标没有配置远程地址或本地备用目录")
+            return
+        save_config()
+
+        # 恢复任务拥有独立代理批次，避免沿用上一次注册任务的 Resin Account。
+        recovery_batch_id = new_resin_batch_id()
+        load_proxy_pool()
+        self.stop_requested = False
+        self.success_count = 0
+        self.fail_count = 0
+        self.fail_stats = empty_fail_stats()
+        self.results = []
+        self.batch_count = pending_count
+        self._batch_started_at = time.time()
+        self.progress_var.set(0)
+        self.eta_var.set(f"进度 0/{pending_count} | ETA --")
+        self._stats_lock = threading.Lock()
+        self._accounts_lock = threading.Lock()
+        self.active_task_kind = "sso_recovery"
+        self.update_stats()
+        self._set_running_ui(True)
+        self.status_var.set("正在重新获取 SSO...")
+        self.status_label.config(foreground="blue")
+        self.log(
+            f"[*] 开始独立 SSO 恢复任务，待处理账号: {pending_count}；"
+            "本任务不检查或调用邮箱 API"
+        )
+        threading.Thread(
+            target=self._run_sso_recovery_entry,
+            args=(recovery_batch_id,),
+            daemon=True,
+        ).start()
+
+    def _run_sso_recovery_entry(self, recovery_batch_id):
+        """在后台准备代理并处理恢复队列，结束后只汇总本次 SSO 恢复结果。"""
+        prepare_sso_recovery_run()
+        try:
+            try:
+                _cleanup_stale_profiles(log_callback=self.log)
+            except Exception:
+                pass
+            if is_resin_proxy_mode(config):
+                _resin_tunnel.ensure(config, log_callback=self.log)
+            bound_proxy, resin_account = bind_proxy_for_account(
+                recovery_batch_id,
+                0,
+                0,
+            )
+            if resin_account:
+                self.log(
+                    "[*] SSO 恢复代理已绑定: "
+                    f"Platform={config.get('resin_platform', RESIN_DEFAULT_PLATFORM)} "
+                    f"Account={resin_account} 入口={redact_proxy(bound_proxy)}"
+                )
+            else:
+                self.log(
+                    f"[*] SSO 恢复代理已绑定: {redact_proxy(bound_proxy) or '直连'}"
+                )
+            result = recover_pending_sso_accounts(
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
+            )
+            self.success_count = int(result.get("success", 0) or 0)
+            self.fail_count = int(result.get("failed", 0) or 0)
+            self.update_stats()
+            self.log(
+                f"[*] SSO 恢复任务结束。成功 {self.success_count} | "
+                f"失败 {self.fail_count}"
+            )
+        except RegistrationCancelled:
+            self.log("[!] SSO 恢复任务已由用户停止")
+        except Exception as exc:
+            self.log(f"[!] SSO 恢复任务异常: {exc}")
+        finally:
+            try:
+                maybe_stop_browser(
+                    user_stopped=bool(self.stop_requested),
+                    log_callback=self.log,
+                )
+            except BaseException:
+                pass
+            self._set_running_ui(False)
 
     def start_registration(self):
         """校验 GUI 配置并启动本轮注册任务。"""
@@ -5276,6 +5418,7 @@ class GrokRegisterGUI:
         self.progress_var.set(0)
         self.eta_var.set(f"进度 0/{count} | ETA --")
         self.update_stats()
+        self.active_task_kind = "registration"
         self._set_running_ui(True)
         self.status_var.set("正在检查...")
         self.status_label.config(foreground="blue")
@@ -5424,11 +5567,16 @@ class GrokRegisterGUI:
         ).start()
 
     def stop_registration(self):
+        """请求停止当前注册或 SSO 恢复任务，并按用户设置决定是否保留浏览器。"""
         self.stop_requested = True
         # 即时写入，worker finally 能读到最新勾选状态
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
         keep = not config.get("close_browser_on_stop", False)
-        self.log("[!] 用户停止注册" + ("（将保留浏览器）" if keep else "（将关闭浏览器）"))
+        task_name = "SSO 恢复" if self.active_task_kind == "sso_recovery" else "注册"
+        self.log(
+            f"[!] 用户停止{task_name}"
+            + ("（将保留浏览器）" if keep else "（将关闭浏览器）")
+        )
 
     def _run_registration_entry(
         self,
@@ -5437,7 +5585,6 @@ class GrokRegisterGUI:
         startup_resin_generation=0,
     ):
         """协调 GUI worker，并让首个 worker 复用启动检查通过的 Resin 代次。"""
-        prepare_sso_recovery_run()
         # 并发数不超过任务数，避免空 worker 白开浏览器
         workers = max(1, min(int(workers or 1), 24, int(count or 1)))
         # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -5528,10 +5675,6 @@ class GrokRegisterGUI:
                 )
             else:
                 wlog(f"[*] 账号代理已绑定: {redact_proxy(bound_proxy) or '直连'}")
-            recover_pending_sso_accounts(
-                log_callback=wlog,
-                cancel_callback=self.should_stop,
-            )
             try:
                 start_browser(log_callback=wlog)
             except Exception as boot_exc:

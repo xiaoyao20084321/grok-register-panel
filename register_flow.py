@@ -25,9 +25,7 @@ from browser_session import (
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
-# Grok 首页地址用于从用户实际可见的登录入口开始恢复已有账号。
-GROK_HOME_URL = "https://grok.com/"
-# 邮箱登录直达地址仅在 Grok 首页入口未能正常推进时作为兜底。
+# 邮箱登录直达地址跳过 Grok 首页和“使用邮箱登录”选择页，直接显示邮箱输入框。
 EMAIL_SIGNIN_URL = "https://accounts.x.ai/sign-in?redirect=grok-com&email=true"
 
 # 资料页 Cloudflare Turnstile：等待自动通过 + 智能点击，不调用 reset()
@@ -135,6 +133,69 @@ def _native_click_action(keywords, deny_keywords=()) -> str:
             return label
         except Exception:
             # 原生点击失败（可能被 Cookie 横幅等覆盖），尝试 JS 直接点击
+            try:
+                element.click(by_js=True)
+                return label
+            except Exception:
+                continue
+    return ""
+
+
+def _native_click_password_submit() -> str:
+    """优先点击密码表单的提交按钮，并返回实际命中的按钮文字。
+
+    该方法只检查可用的 ``button`` 与提交型 ``input``，优先选择
+    ``type=submit``、精确登录文案或带 submit/login 测试标识的控件，避免误点
+    页面上的注册链接、第三方登录入口或说明链接。点击会触发真实 CDP 事件；
+    原生点击被遮挡时才使用 JS 点击兜底。
+    """
+    keywords = ("登录", "sign in", "log in", "下一步", "continue")
+    denied_keywords = (
+        "使用",
+        "with",
+        "google",
+        "apple",
+        "注册",
+        "sign up",
+        "返回",
+        "back",
+        "忘记",
+        "forgot",
+        "passkey",
+    )
+    normalized_keywords = [item.replace(" ", "").lower() for item in keywords]
+    normalized_denied = [item.replace(" ", "").lower() for item in denied_keywords]
+    candidates = []
+    for tag in ("button", "input"):
+        for element in _native_elements(tag):
+            if not _native_is_usable(element):
+                continue
+            input_type = _native_attr(element, "type").lower()
+            if tag == "input" and input_type not in ("submit", "button"):
+                continue
+            if _native_attr(element, "aria-disabled").lower() == "true":
+                continue
+            label = _native_label(element)
+            compact = re.sub(r"\s+", "", label).lower()
+            if not compact or any(item in compact for item in normalized_denied):
+                continue
+            matches = [item for item in normalized_keywords if item and item in compact]
+            testid = _native_attr(element, "data-testid").lower()
+            if not matches and not any(item in testid for item in ("submit", "login", "signin")):
+                continue
+            score = max((len(item) for item in matches), default=0)
+            if input_type == "submit":
+                score += 300
+            if compact in normalized_keywords:
+                score += 200
+            if any(item in testid for item in ("submit", "login", "signin")):
+                score += 100
+            candidates.append((score, element, label))
+    for _, element, label in sorted(candidates, key=lambda item: item[0], reverse=True):
+        try:
+            element.click(timeout=3)
+            return label
+        except Exception:
             try:
                 element.click(by_js=True)
                 return label
@@ -1922,11 +1983,12 @@ def login_grok_with_email_password(
     log_callback=None,
     cancel_callback=None,
 ):
-    """从 Grok 首页使用邮箱和密码登录已有账号并等待进入重定向阶段。
+    """从 xAI 邮箱直达页登录已有账号并等待进入 Grok 重定向阶段。
 
     输入为已创建的 Grok 邮箱和登录密码；函数会产生真实登录请求，但不会读取、
     返回或记录密码。返回值只包含登录后的页面地址，SSO 由调用方继续通过
-    ``wait_for_sso_cookie`` 获取。首页入口异常时会回退到官方邮箱登录地址。
+    ``wait_for_sso_cookie`` 获取。每个页面阶段使用独立超时，避免前一阶段等待
+    挤占密码提交后的重定向时间。
     """
     normalized_email = str(email or "").strip()
     normalized_password = str(password or "")
@@ -1945,55 +2007,23 @@ def login_grok_with_email_password(
         set_browser_session(browser_obj, page_obj)
 
     if log_callback:
-        log_callback(f"[*] SSO 恢复：打开 Grok 登录页 ({normalized_email})")
-    page_obj.get(GROK_HOME_URL)
+        log_callback(f"[*] SSO 恢复：打开 xAI 邮箱登录页 ({normalized_email})")
+    page_obj.get(EMAIL_SIGNIN_URL)
     try:
         page_obj.wait.doc_loaded()
     except Exception:
         pass
     sleep_with_cancel(0.8, cancel_callback)
 
-    login_started = time.time()
-    deadline = login_started + max(float(timeout or 45), 15.0)
-    direct_fallback_used = False
+    stage_timeout = max(float(timeout or 45), 15.0)
+    email_deadline = time.time() + stage_timeout
     email_candidates = []
-    while time.time() < deadline:
+    while time.time() < email_deadline:
         raise_if_cancelled(cancel_callback)
         refresh_active_page()
         email_candidates = _native_input_candidates("email")
         if email_candidates:
             break
-        current_url = str(getattr(page, "url", "") or "")
-        if "accounts.x.ai" in current_url:
-            clicked = _native_click_action(
-                (
-                    "使用邮箱登录",
-                    "sign in with email",
-                    "login with email",
-                    "continue with email",
-                ),
-                deny_keywords=("注册", "sign up", "register"),
-            )
-            if clicked and log_callback:
-                log_callback("[*] SSO 恢复：已点击“使用邮箱登录”")
-        else:
-            clicked = _native_click_action(
-                ("登录", "sign in", "log in"),
-                deny_keywords=("注册", "sign up", "register", "google", "apple"),
-            )
-            if clicked and log_callback:
-                log_callback("[*] SSO 恢复：已点击 Grok“登录”")
-
-        # Grok SPA 偶发只渲染空壳；先走真实首页入口，迟迟无邮箱框时再使用官方直达页。
-        if not direct_fallback_used and time.time() - login_started >= 8:
-            direct_fallback_used = True
-            if log_callback:
-                log_callback("[!] Grok 登录入口未出现邮箱框，回退到官方邮箱登录页")
-            page.get(EMAIL_SIGNIN_URL)
-            try:
-                page.wait.doc_loaded()
-            except Exception:
-                pass
         sleep_with_cancel(0.5, cancel_callback)
     if not email_candidates:
         raise Exception(
@@ -2010,8 +2040,9 @@ def login_grok_with_email_password(
     if log_callback:
         log_callback("[*] SSO 恢复：邮箱已提交，等待密码输入框")
 
+    password_deadline = time.time() + stage_timeout
     password_candidates = []
-    while time.time() < deadline:
+    while time.time() < password_deadline:
         raise_if_cancelled(cancel_callback)
         refresh_active_page()
         password_candidates = _native_input_candidates("password")
@@ -2024,24 +2055,25 @@ def login_grok_with_email_password(
         )
     if not _native_type_element(password_candidates[0], normalized_password):
         raise Exception("SSO 恢复登录失败：密码输入写入失败")
-    if not _native_click_action(
-        ("登录", "sign in", "log in"),
-        deny_keywords=(
-            "使用",
-            "with",
-            "google",
-            "apple",
-            "注册",
-            "sign up",
-            "返回",
-            "back",
-        ),
-    ):
+    # React 表单可能在输入事件后短暂保持按钮禁用；等待按钮可用后再真实点击。
+    submit_deadline = time.time() + min(stage_timeout, 10.0)
+    clicked_login_label = ""
+    while time.time() < submit_deadline and not clicked_login_label:
+        raise_if_cancelled(cancel_callback)
+        refresh_active_page()
+        clicked_login_label = _native_click_password_submit()
+        if not clicked_login_label:
+            sleep_with_cancel(0.3, cancel_callback)
+    if not clicked_login_label:
         raise Exception("SSO 恢复登录失败：未找到密码页“登录”按钮")
     if log_callback:
-        log_callback("[*] SSO 恢复：密码已提交，等待 accounts.x.ai 重定向")
+        log_callback(
+            "[*] SSO 恢复：已点击密码页登录按钮"
+            f"（{clicked_login_label[:80]}），等待 accounts.x.ai 重定向"
+        )
 
-    while time.time() < deadline:
+    redirect_deadline = time.time() + stage_timeout
+    while time.time() < redirect_deadline:
         raise_if_cancelled(cancel_callback)
         refresh_active_page()
         current_url = str(getattr(page, "url", "") or "")
