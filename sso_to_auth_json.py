@@ -1427,14 +1427,14 @@ def write_grok2api_auth(auth_dir: Path, token: dict, email: str = "") -> Path:
 
 
 def normalize_grok2api_sso(raw_sso: str) -> str:
-    """规范化 Grok Web SSO，只保留 cookie 值并拒绝空凭据。"""
+    """规范化 Grok2API Web/Console 共用的 SSO，只保留 cookie 值并拒绝空凭据。"""
     value = str(raw_sso or "").strip()
     if value.lower().startswith("sso="):
         value = value[4:].strip()
     value = value.split(";", 1)[0]
     value = value.replace("\r", "").replace("\n", "").replace("\x00", "").strip()
     if not value:
-        raise ValueError("Grok2API Grok Web 导入记录缺少 SSO")
+        raise ValueError("Grok2API Grok Web/Console 导入记录缺少 SSO")
     return value
 
 
@@ -1473,6 +1473,51 @@ def write_grok2api_web_auth(
     path = auth_dir / grok2api_web_auth_filename(sso, email=email)
     temporary = path.with_suffix(path.suffix + ".tmp")
     payload = sso_to_grok2api_web_document(sso, email=email)
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    _ensure_private_file(path)
+    return path
+
+
+def grok2api_console_auth_filename(sso: str, email: str = "") -> str:
+    """生成 Grok Console 单账号导入文件名，邮箱缺失时使用 SSO 摘要避免覆盖。"""
+    normalized = normalize_grok2api_sso(sso)
+    ident = str(email or "").strip() or hashlib.sha256(
+        normalized.encode("utf-8")
+    ).hexdigest()[:12]
+    return f"grok2api-grok-console-accounts-{_safe_email_for_filename(ident)}.json"
+
+
+def sso_to_grok2api_console_document(sso: str, email: str = "") -> dict:
+    """把 Web 共用 SSO 转换成 Grok2API Console 管理接口可导入的账号文档。"""
+    normalized = normalize_grok2api_sso(sso)
+    resolved_email = str(email or "").strip()
+    name = resolved_email or (
+        f"Grok Console {hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:8]}"
+    )
+    account = {
+        "provider": "grok_console",
+        "name": name,
+        "sso_token": normalized,
+    }
+    if resolved_email:
+        account["email"] = resolved_email
+    return {"provider": "grok_console", "accounts": [account]}
+
+
+def write_grok2api_console_auth(
+    auth_dir: Path,
+    sso: str,
+    email: str = "",
+) -> Path:
+    """写出 Grok Console SSO 本地备用文件，供管理后台 Console 标签直接导入。"""
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    path = auth_dir / grok2api_console_auth_filename(sso, email=email)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = sso_to_grok2api_console_document(sso, email=email)
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

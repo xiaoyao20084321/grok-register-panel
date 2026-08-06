@@ -111,12 +111,13 @@ cp config.example.json config.json
 | `cpa_auth_dir` | CPA 远程交付最终失败时保存 `xai-*.json` 的本地备用目录 |
 | `grok2api_remote_url` | Grok2API 管理后台基础地址 |
 | `grok2api_admin_username` / `grok2api_admin_password` | Grok2API 管理员登录信息 |
-| `grok2api_auth_dir` | Grok2API 远程交付最终失败时保存 Web/Build 导入 JSON 的本地备用目录 |
+| `grok2api_auth_dir` | Grok2API 远程交付最终失败时保存 Web/Console/Build 导入 JSON 的本地备用目录 |
 
 开启 auth 输出后，每个远程上传首次失败会额外重试 3 次，仍失败才写入对应
 本地备用目录。程序会先完成 OAuth 换取和导入文档转换，再并行交付 CPA、
-Grok2API Web SSO 与 Grok2API Build OAuth；Web 与 Build 使用两个独立接口和
-独立重试链。OAuth 换取失败时，会在换取流程结束后单独交付已经取得的 Web SSO。
+Grok2API Web SSO、Grok2API Console SSO 与 Grok2API Build OAuth；三种
+Grok2API 账号使用独立接口和独立重试链。OAuth 换取失败时，会在换取流程结束后
+继续交付已经取得的同一份 Web/Console SSO，仅跳过缺少 OAuth Token 的 Build。
 未勾选的输出目标不会上传，也不会生成本地备用文件。
 
 ### OutlookEmail 完整 API

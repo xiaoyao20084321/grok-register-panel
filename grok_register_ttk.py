@@ -445,7 +445,7 @@ DEFAULT_CONFIG = {
     "cpa_auto_add": False,
     # CPA 输出默认开启；关闭后既不上传 CPA，也不生成 CPA 本地备用文件。
     "cpa_enabled": True,
-    # Grok2API 输出默认开启；关闭后不处理 Grok Web 和 Grok Build。
+    # Grok2API 输出默认开启；关闭后不处理 Grok Web、Console 和 Grok Build。
     "grok2api_enabled": True,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
@@ -454,7 +454,7 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
-    # Grok2API 远程不可用时，把 Web/Build 导入文件写入此本地备用目录。
+    # Grok2API 远程不可用时，把 Web/Console/Build 导入文件写入此本地备用目录。
     "grok2api_auth_dir": "grok2api_auth",
     # Grok2API 管理后台基础地址；程序会自行拼接登录和账号导入路径。
     "grok2api_remote_url": "",
@@ -1448,7 +1448,7 @@ def _get_grok2api_admin_token(
     username: str,
     password: str,
 ) -> str:
-    """登录 Grok2API 并缓存管理员 Bearer Token，供 Web/Build 导入共用。"""
+    """登录 Grok2API 并缓存管理员 Bearer Token，供 Web/Console/Build 导入共用。"""
     base = str(base_url or "").strip().rstrip("/")
     admin_username = str(username or "").strip()
     admin_password = str(password or "")
@@ -1650,7 +1650,7 @@ def upload_grok2api_document_remote(
     filename: str,
     document: dict,
 ) -> dict:
-    """登录 Grok2API 后以 CurlMime multipart 上传 Web 或 Build 账号文档。"""
+    """登录 Grok2API 后以 CurlMime multipart 上传 Web、Console 或 Build 账号文档。"""
     base = str(base_url or "").strip().rstrip("/")
     access_token = _get_grok2api_admin_token(base, username, password)
     # CurlMime 对齐 Grok2API 管理后台的 multipart/form-data 文件上传格式。
@@ -1777,7 +1777,7 @@ def _deliver_grok2api_document(
     local_writer,
     log_callback=None,
 ) -> bool:
-    """将 Grok2API 文档远程优先交付，失败时调用对应 Web/Build 本地写入器。"""
+    """远程优先交付 Grok2API 文档，失败时调用对应 Web/Console/Build 写入器。"""
     remote_url = str(config.get("grok2api_remote_url", "") or "").strip()
     admin_username = str(
         config.get("grok2api_admin_username", "") or ""
@@ -1912,7 +1912,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
     """按独立开关将 SSO/OAuth 远程优先写入 CPA 与 Grok2API。
 
     先完成 OAuth 换取与文档转换，再并行交付所有已勾选目标。OAuth 失败时，
-    会等换取流程结束后单独交付 Web SSO。每个远程目标独立重试和本地降级。
+    会等换取流程结束后单独交付 Web/Console SSO。每个远程目标独立重试和
+    本地降级，任一 Grok2API 目标失败都不会中断另外两路交付。
     """
     if not config.get("cpa_auto_add", False):
         if log_callback:
@@ -1999,8 +2000,15 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
         _auth_log(f"SSO 换 token 异常: {exc}")
 
     if not token:
-        _auth_log("SSO 换 token 失败；换取流程已结束，开始处理 Grok2API Web SSO")
-        grok2api_web_ok = True
+        _auth_log(
+            "SSO 换 token 失败；换取流程已结束，开始处理 Grok2API Web/Console SSO"
+        )
+        # Build 无 token 时只跳过 Build；Web 与 Console 仍使用原始 SSO 独立交付。
+        sso_delivery_status = {
+            "grok2api_web": not grok2api_enabled,
+            "grok2api_console": not grok2api_enabled,
+        }
+        sso_delivery_tasks = []
         if grok2api_enabled:
             try:
                 web_document = _s2cpa.sso_to_grok2api_web_document(
@@ -2020,20 +2028,84 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                         email=email,
                     )
 
-                grok2api_web_ok = _deliver_grok2api_document(
-                    "Web SSO",
-                    "/api/admin/v1/accounts/web/import",
-                    web_filename,
-                    web_document,
-                    _write_failed_auth_web_fallback,
-                    log_callback=_auth_log,
+                sso_delivery_tasks.append(
+                    (
+                        "grok2api_web",
+                        "Grok2API Web SSO",
+                        (
+                            "Web SSO",
+                            "/api/admin/v1/accounts/web/import",
+                            web_filename,
+                            web_document,
+                            _write_failed_auth_web_fallback,
+                        ),
+                    )
                 )
             except Exception as exc:
-                grok2api_web_ok = False
+                sso_delivery_status["grok2api_web"] = False
                 _auth_log(f"Grok2API Web SSO 准备失败: {exc}")
-        if cpa_enabled or not grok2api_web_ok:
+
+            try:
+                console_document = _s2cpa.sso_to_grok2api_console_document(
+                    sso,
+                    email=email,
+                )
+                console_filename = _s2cpa.grok2api_console_auth_filename(
+                    sso,
+                    email=email,
+                )
+
+                def _write_failed_auth_console_fallback(local_dir):
+                    """OAuth 失败时把 Console SSO 写入 Grok2API 本地备用目录。"""
+                    return _s2cpa.write_grok2api_console_auth(
+                        local_dir,
+                        sso,
+                        email=email,
+                    )
+
+                sso_delivery_tasks.append(
+                    (
+                        "grok2api_console",
+                        "Grok2API Console SSO",
+                        (
+                            "Console SSO",
+                            "/api/admin/v1/accounts/console/import",
+                            console_filename,
+                            console_document,
+                            _write_failed_auth_console_fallback,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                sso_delivery_status["grok2api_console"] = False
+                _auth_log(f"Grok2API Console SSO 准备失败: {exc}")
+
+        if sso_delivery_tasks:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(sso_delivery_tasks),
+                thread_name_prefix="grok2api-sso-delivery",
+            ) as executor:
+                # 两个 SSO 目标独立上传，任一路失败不会取消另一条链路。
+                future_targets = {
+                    executor.submit(
+                        _deliver_grok2api_document,
+                        *task[2],
+                        log_callback=_auth_log,
+                    ): (task[0], task[1])
+                    for task in sso_delivery_tasks
+                }
+                for future in concurrent.futures.as_completed(future_targets):
+                    target_key, target_label = future_targets[future]
+                    try:
+                        sso_delivery_status[target_key] = bool(future.result())
+                    except Exception as exc:
+                        sso_delivery_status[target_key] = False
+                        _auth_log(f"{target_label} 交付线程异常: {exc}")
+
+        grok2api_sso_ok = all(sso_delivery_status.values())
+        if cpa_enabled or not grok2api_sso_ok:
             _append_sso_pending(email, sso, log_callback=log_callback)
-        return grok2api_web_ok and not cpa_enabled
+        return grok2api_sso_ok and not cpa_enabled
 
     access_payload = _s2cpa.decode_jwt_payload(
         str(token.get("access_token") or token.get("key") or "")
@@ -2046,9 +2118,10 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
     delivery_status = {
         "cpa": not cpa_enabled,
         "grok2api_web": not grok2api_enabled,
+        "grok2api_console": not grok2api_enabled,
         "grok2api_build": not grok2api_enabled,
     }
-    # 先完成全部文档转换，再统一启动上传，避免 Web SSO 抢在 auth 之前发送。
+    # 先完成全部文档转换，再统一启动上传，确保三路从同一份本轮凭据出发。
     delivery_tasks = []
     if cpa_enabled:
         try:
@@ -2103,6 +2176,43 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
         except Exception as exc:
             delivery_status["grok2api_web"] = False
             _auth_log(f"Grok2API Web SSO 准备失败: {exc}")
+
+        try:
+            console_document = _s2cpa.sso_to_grok2api_console_document(
+                sso,
+                email=email,
+            )
+            console_filename = _s2cpa.grok2api_console_auth_filename(
+                sso,
+                email=email,
+            )
+
+            def _write_console_fallback(local_dir):
+                """把远程交付失败的 Console SSO 写入 Grok2API 本地备用目录。"""
+                return _s2cpa.write_grok2api_console_auth(
+                    local_dir,
+                    sso,
+                    email=email,
+                )
+
+            delivery_tasks.append(
+                (
+                    "grok2api_console",
+                    "Grok2API Console SSO",
+                    _deliver_grok2api_document,
+                    (
+                        "Console SSO",
+                        "/api/admin/v1/accounts/console/import",
+                        console_filename,
+                        console_document,
+                        _write_console_fallback,
+                    ),
+                    {"log_callback": _auth_log},
+                )
+            )
+        except Exception as exc:
+            delivery_status["grok2api_console"] = False
+            _auth_log(f"Grok2API Console SSO 准备失败: {exc}")
 
         try:
             build_account = _s2cpa.token_to_grok2api_account(
@@ -4717,9 +4827,9 @@ class GrokRegisterGUI:
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
         # CPA 管理密钥用于 Bearer 鉴权，日志和输入框均不会明文展示。
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
-        # Grok2API 本地目录分别承接 Web 与 Build 远程失败后的备用文件。
+        # Grok2API 本地目录分别承接 Web、Console 与 Build 远程失败后的备用文件。
         self.grok2api_auth_dir_var = tk.StringVar(value=str(config.get("grok2api_auth_dir", "")))
-        # Grok2API 服务器地址作为管理员登录及两个导入接口的共同基础地址。
+        # Grok2API 服务器地址作为管理员登录及三个导入接口的共同基础地址。
         self.grok2api_remote_url_var = tk.StringVar(
             value=str(config.get("grok2api_remote_url", ""))
         )
